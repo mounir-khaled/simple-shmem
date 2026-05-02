@@ -1,9 +1,9 @@
 use std::{io, ptr::NonNull};
 
-use crate::{futex::Futex, ringbuffer::RingBuffer};
+use crate::{ringbuffer::RingBuffer, shared_mutex::SharedMutex};
 
 pub struct MmappedRingBuffer<const N: usize> {
-    rb: NonNull<Futex<RingBuffer<N>>>,
+    rb: NonNull<SharedMutex<RingBuffer<N>>>,
 }
 
 impl<const N: usize> MmappedRingBuffer<N> {
@@ -17,10 +17,11 @@ impl<const N: usize> MmappedRingBuffer<N> {
             return Err(io::Error::last_os_error());
         }
 
-        let ringbuffer_futex = NonNull::new(mem as *mut Futex<RingBuffer<N>>).ok_or_else(|| {
-            unsafe { libc::munmap(mem, size) };
-            io::Error::new(io::ErrorKind::Other, "Failed to create NonNull pointer")
-        })?;
+        let ringbuffer_futex =
+            NonNull::new(mem as *mut SharedMutex<RingBuffer<N>>).ok_or_else(|| {
+                unsafe { libc::munmap(mem, size) };
+                io::Error::new(io::ErrorKind::Other, "Failed to create NonNull pointer")
+            })?;
 
         Ok(Self {
             rb: ringbuffer_futex,
@@ -28,11 +29,11 @@ impl<const N: usize> MmappedRingBuffer<N> {
     }
 
     pub fn initialize(&mut self) {
-        unsafe { *self.rb.as_ptr() = Futex::new(RingBuffer::default()) };
+        unsafe { *self.rb.as_ptr() = SharedMutex::new(RingBuffer::default()) };
     }
 
     pub const fn object_size() -> usize {
-        size_of::<Futex<RingBuffer<N>>>()
+        size_of::<SharedMutex<RingBuffer<N>>>()
     }
 }
 

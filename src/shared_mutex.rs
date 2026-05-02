@@ -9,17 +9,17 @@ pub const LOCKED: u32 = 1;
 pub const CONTENDED: u32 = 2;
 
 #[repr(C)]
-pub struct Futex<T> {
+pub struct SharedMutex<T> {
     state: AtomicU32,
     data: UnsafeCell<T>,
 }
 
 pub struct FutexGuard<'a, T> {
-    futex: &'a Futex<T>,
+    futex: &'a SharedMutex<T>,
     data: &'a mut T,
 }
 
-impl<T> Futex<T> {
+impl<T> SharedMutex<T> {
     pub fn new(data: T) -> Self {
         Self {
             state: AtomicU32::new(UNLOCKED),
