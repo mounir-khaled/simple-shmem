@@ -3,58 +3,20 @@
 mod futex;
 mod mmapped_rb;
 mod page_size;
+mod producer_consumer;
 mod ringbuffer;
 
+use producer_consumer::{Consumer, Producer};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use crate::mmapped_rb::MmappedRingBuffer;
 use crate::page_size::page_size;
-
-struct Consumer<const N: usize>(MmappedRingBuffer<N>);
-struct Producer<const N: usize>(MmappedRingBuffer<N>);
 
 pub struct DualRingBuffer<const N: usize> {
     consumer: Consumer<N>,
     producer: Producer<N>,
-}
-
-impl<const N: usize> Consumer<N> {
-    pub fn new(fd: i32, offset: i64) -> io::Result<Self> {
-        Ok(Self(MmappedRingBuffer::new(fd, offset)?))
-    }
-
-    pub fn object_size() -> usize {
-        MmappedRingBuffer::<N>::object_size()
-    }
-}
-
-impl<const N: usize> io::Read for Consumer<N> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl<const N: usize> Producer<N> {
-    pub fn new(fd: i32, offset: i64) -> io::Result<Self> {
-        Ok(Self(MmappedRingBuffer::new(fd, offset)?))
-    }
-
-    pub fn object_size() -> usize {
-        MmappedRingBuffer::<N>::object_size()
-    }
-}
-
-impl<const N: usize> io::Write for Producer<N> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 impl<const N: usize> DualRingBuffer<N> {
@@ -77,10 +39,10 @@ impl<const N: usize> DualRingBuffer<N> {
         let fd = file.as_raw_fd();
 
         let mut consumer = Consumer::new(fd, 0)?;
-        consumer.0.initialize();
+        consumer.initialize();
 
         let mut producer = Producer::new(fd, Self::rb_offset() as i64)?;
-        producer.0.initialize();
+        producer.initialize();
 
         Ok(Self { consumer, producer })
     }
