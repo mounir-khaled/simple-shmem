@@ -2,7 +2,9 @@ use std::{io, ptr::NonNull};
 
 use crate::{futex::Futex, ringbuffer::RingBuffer};
 
-pub struct MmappedRingBuffer<const N: usize>(NonNull<Futex<RingBuffer<N>>>);
+pub struct MmappedRingBuffer<const N: usize> {
+    rb: NonNull<Futex<RingBuffer<N>>>,
+}
 
 impl<const N: usize> MmappedRingBuffer<N> {
     pub fn new(fd: i32, offset: libc::off_t) -> io::Result<Self> {
@@ -15,16 +17,18 @@ impl<const N: usize> MmappedRingBuffer<N> {
             return Err(io::Error::last_os_error());
         }
 
-        let rb = NonNull::new(mem as *mut Futex<RingBuffer<N>>).ok_or_else(|| {
+        let ringbuffer_futex = NonNull::new(mem as *mut Futex<RingBuffer<N>>).ok_or_else(|| {
             unsafe { libc::munmap(mem, size) };
             io::Error::new(io::ErrorKind::Other, "Failed to create NonNull pointer")
         })?;
 
-        Ok(Self(rb))
+        Ok(Self {
+            rb: ringbuffer_futex,
+        })
     }
 
     pub fn initialize(&mut self) {
-        unsafe { *self.0.as_ptr() = Futex::new(RingBuffer::default()) };
+        unsafe { *self.rb.as_ptr() = Futex::new(RingBuffer::default()) };
     }
 
     pub const fn object_size() -> usize {
@@ -34,7 +38,7 @@ impl<const N: usize> MmappedRingBuffer<N> {
 
 impl<const N: usize> io::Read for MmappedRingBuffer<N> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let futex = unsafe { self.0.as_mut() };
+        let futex = unsafe { self.rb.as_mut() };
         let mut guard = futex.lock()?;
         guard.read(buf)
     }
@@ -42,7 +46,7 @@ impl<const N: usize> io::Read for MmappedRingBuffer<N> {
 
 impl<const N: usize> io::Write for MmappedRingBuffer<N> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let futex = unsafe { self.0.as_mut() };
+        let futex = unsafe { self.rb.as_mut() };
         let mut guard = futex.lock()?;
         guard.write(buf)
     }
@@ -55,7 +59,7 @@ impl<const N: usize> io::Write for MmappedRingBuffer<N> {
 impl<const N: usize> Drop for MmappedRingBuffer<N> {
     fn drop(&mut self) {
         let size = Self::object_size();
-        let status = unsafe { libc::munmap(self.0.as_ptr() as *mut libc::c_void, size) };
+        let status = unsafe { libc::munmap(self.rb.as_ptr() as *mut libc::c_void, size) };
         if status == -1 {
             let err = unsafe { *libc::__errno_location() };
             panic!("Failed to unmap memory: {}", err);

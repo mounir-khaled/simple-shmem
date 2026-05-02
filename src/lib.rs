@@ -5,7 +5,10 @@ mod mmapped_rb;
 mod page_size;
 mod ringbuffer;
 
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
+use std::path::Path;
 
 use crate::mmapped_rb::MmappedRingBuffer;
 use crate::page_size::page_size;
@@ -55,56 +58,51 @@ impl<const N: usize> io::Write for Producer<N> {
 }
 
 impl<const N: usize> DualRingBuffer<N> {
-    fn rb_offset() -> i64 {
+    fn rb_offset() -> usize {
         assert_eq!(Consumer::<N>::object_size(), Producer::<N>::object_size());
-        let rb_size = Consumer::<N>::object_size() as i64;
-        let page_size = page_size() as i64;
+        let rb_size = Consumer::<N>::object_size();
+        let page_size = page_size();
         let offset = ((rb_size - 1) / page_size + 1) * page_size;
 
         offset
     }
 
-    fn mmap_size() -> i64 {
+    fn mmap_size() -> usize {
         assert_eq!(Consumer::<N>::object_size(), Producer::<N>::object_size());
-        Self::rb_offset() + Consumer::<N>::object_size() as i64
+        Self::rb_offset() + Consumer::<N>::object_size()
     }
 
-    pub fn new_server(fd: i32) -> io::Result<Self> {
+    pub fn new_server<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = Self::open_mmapped_file(path, true)?;
+        let fd = file.as_raw_fd();
+
         let mut consumer = Consumer::new(fd, 0)?;
         consumer.0.initialize();
 
-        let mut producer = Producer::new(fd, Self::rb_offset())?;
+        let mut producer = Producer::new(fd, Self::rb_offset() as i64)?;
         producer.0.initialize();
 
         Ok(Self { consumer, producer })
     }
 
-    pub fn new_client(fd: i32) -> io::Result<Self> {
+    pub fn new_client<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = Self::open_mmapped_file(path, false)?;
+        let fd = file.as_raw_fd();
+
         Ok(Self {
-            consumer: Consumer::new(fd, Self::rb_offset())?,
+            consumer: Consumer::new(fd, Self::rb_offset() as i64)?,
             producer: Producer::new(fd, 0)?,
         })
     }
 
-    pub fn open_mmapped_file(mut name: String) -> io::Result<i32> {
-        name.push('\0');
-        let file = unsafe {
-            libc::shm_open(
-                name.as_bytes().as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_CREAT,
-                libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IWGRP,
-            )
-        };
+    fn open_mmapped_file<P: AsRef<Path>>(path: P, create: bool) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(create)
+            .open(path)?;
 
-        if file == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let status = unsafe { libc::ftruncate(file, Self::mmap_size()) };
-        if status == -1 {
-            unsafe { libc::close(file) };
-            return Err(io::Error::last_os_error());
-        }
+        file.set_len(Self::mmap_size() as u64)?;
 
         Ok(file)
     }

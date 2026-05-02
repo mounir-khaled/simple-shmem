@@ -4,11 +4,8 @@ use std::time::Instant;
 use simple_shmem::DualRingBuffer;
 
 fn main() {
-    let shmem_fd = DualRingBuffer::<1024>::open_mmapped_file("/pingpong".into())
-        .expect("failed to open mmapped file");
-
-    let mut ring_buffer =
-        DualRingBuffer::<1024>::new_server(shmem_fd).expect("failed to create DualRingBuffer");
+    let mut ring_buffer = DualRingBuffer::<1024>::new_server("/dev/shm/pingpong")
+        .expect("failed to create DualRingBuffer");
 
     let mut buf = vec![0u8; 4];
     let mut start = Instant::now();
