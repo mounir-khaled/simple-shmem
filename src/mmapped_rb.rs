@@ -1,9 +1,9 @@
 use std::{io, ptr::NonNull};
 
-use crate::{ringbuffer::RingBuffer, shared_mutex::SharedMutex};
+use crate::ringbuffer::RingBuffer;
 
 pub struct MmappedRingBuffer<const N: usize> {
-    rb: NonNull<SharedMutex<RingBuffer<N>>>,
+    rb: NonNull<RingBuffer<N>>,
 }
 
 impl<const N: usize> MmappedRingBuffer<N> {
@@ -17,11 +17,10 @@ impl<const N: usize> MmappedRingBuffer<N> {
             return Err(io::Error::last_os_error());
         }
 
-        let ringbuffer_futex =
-            NonNull::new(mem as *mut SharedMutex<RingBuffer<N>>).ok_or_else(|| {
-                unsafe { libc::munmap(mem, size) };
-                io::Error::new(io::ErrorKind::Other, "Failed to create NonNull pointer")
-            })?;
+        let ringbuffer_futex = NonNull::new(mem as *mut RingBuffer<N>).ok_or_else(|| {
+            unsafe { libc::munmap(mem, size) };
+            io::Error::new(io::ErrorKind::Other, "Failed to create NonNull pointer")
+        })?;
 
         Ok(Self {
             rb: ringbuffer_futex,
@@ -29,27 +28,23 @@ impl<const N: usize> MmappedRingBuffer<N> {
     }
 
     pub fn initialize(&mut self) {
-        unsafe { *self.rb.as_ptr() = SharedMutex::new(RingBuffer::default()) };
+        unsafe { *self.rb.as_ptr() = RingBuffer::default() };
     }
 
     pub const fn object_size() -> usize {
-        size_of::<SharedMutex<RingBuffer<N>>>()
+        size_of::<RingBuffer<N>>()
     }
 }
 
 impl<const N: usize> io::Read for MmappedRingBuffer<N> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let futex = unsafe { self.rb.as_mut() };
-        let mut guard = futex.lock()?;
-        guard.read(buf)
+        unsafe { self.rb.as_mut() }.read(buf)
     }
 }
 
 impl<const N: usize> io::Write for MmappedRingBuffer<N> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let futex = unsafe { self.rb.as_mut() };
-        let mut guard = futex.lock()?;
-        guard.write(buf)
+        unsafe { self.rb.as_mut() }.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
