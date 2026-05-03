@@ -4,7 +4,6 @@ mod mmapped_rb;
 mod page_size;
 mod producer_consumer;
 mod ringbuffer;
-mod server_dir;
 
 use producer_consumer::{Consumer, Producer};
 use std::fs::{File, OpenOptions};
