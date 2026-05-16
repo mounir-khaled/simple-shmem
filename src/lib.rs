@@ -1,86 +1,63 @@
 #![allow(dead_code)]
 
-mod mmapped_rb;
+mod dual_ringbuffer;
+mod futex;
 mod page_size;
 mod producer_consumer;
-mod ringbuffer;
+mod ringbuffer_parts;
+mod umask_context;
 
-use producer_consumer::{Consumer, Producer};
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::fd::AsRawFd;
-use std::path::Path;
+mod listener;
 
-use crate::page_size::page_size;
+use std::{
+    fs::{Metadata, OpenOptions},
+    io::{self},
+    os::unix::fs::OpenOptionsExt,
+};
 
-pub struct DualRingBuffer<const N: usize> {
-    consumer: Consumer<N>,
-    producer: Producer<N>,
+use ring::agreement;
+use thiserror::Error;
+
+pub use crate::dual_ringbuffer::{DualRingBuffers, DualRingBuffersError};
+pub use crate::listener::Listener;
+
+// 64-byte cache-line header + 4032-byte buffer = exactly one 4096-byte page
+pub type StdListener<P> = Listener<P, 4032>;
+pub type StdDualRingBuffers = DualRingBuffers<4032>;
+
+const KEX_ALG: &agreement::Algorithm = &agreement::ECDH_P256;
+
+fn owned_file_options() -> OpenOptions {
+    let mut oo = OpenOptions::new();
+
+    oo.read(true)
+        .write(true)
+        .truncate(true)
+        .create_new(true)
+        .mode(0o644);
+
+    oo
 }
 
-impl<const N: usize> DualRingBuffer<N> {
-    fn rb_offset() -> usize {
-        assert_eq!(Consumer::<N>::object_size(), Producer::<N>::object_size());
-        let rb_size = Consumer::<N>::object_size();
-        let page_size = page_size();
-        let offset = ((rb_size - 1) / page_size + 1) * page_size;
+fn shared_file_options() -> OpenOptions {
+    let mut oo = OpenOptions::new();
+    oo.read(true).custom_flags(libc::O_NOFOLLOW);
 
-        offset
-    }
-
-    fn mmap_size() -> usize {
-        assert_eq!(Consumer::<N>::object_size(), Producer::<N>::object_size());
-        Self::rb_offset() + Consumer::<N>::object_size()
-    }
-
-    pub fn new_server<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = Self::open_mmapped_file(path, true)?;
-        let fd = file.as_raw_fd();
-
-        let mut consumer = Consumer::new(fd, 0)?;
-        consumer.initialize();
-
-        let mut producer = Producer::new(fd, Self::rb_offset() as i64)?;
-        producer.initialize();
-
-        Ok(Self { consumer, producer })
-    }
-
-    pub fn new_client<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = Self::open_mmapped_file(path, false)?;
-        let fd = file.as_raw_fd();
-
-        Ok(Self {
-            consumer: Consumer::new(fd, Self::rb_offset() as i64)?,
-            producer: Producer::new(fd, 0)?,
-        })
-    }
-
-    fn open_mmapped_file<P: AsRef<Path>>(path: P, create: bool) -> io::Result<File> {
-        let file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create(create)
-            .open(path)?;
-
-        file.set_len(Self::mmap_size() as u64)?;
-
-        Ok(file)
-    }
+    oo
 }
 
-impl<const N: usize> io::Read for DualRingBuffer<N> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.consumer.read(buf)
-    }
-}
-
-impl<const N: usize> io::Write for DualRingBuffer<N> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.producer.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+#[derive(Error, Debug)]
+pub enum ConnectionError {
+    #[error("Directory error: {0}")]
+    Dir(io::Error),
+    #[error("Key agreement error: {0}")]
+    KeyAgreement(ring::error::Unspecified),
+    #[error("Ring buffer error: {0}")]
+    RingBufferError(DualRingBuffersError),
+    #[error("I/O error: {0}")]
+    Io(io::Error),
+    #[error("Peer rejected: {0:?}")]
+    PeerRejected(Metadata),
+    #[error("Client error")]
+    ClientError,
 }

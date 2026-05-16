@@ -1,30 +1,40 @@
+use std::error::Error;
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::os::unix::fs::MetadataExt;
 
-use simple_shmem::DualRingBuffer;
+use simple_shmem::StdListener;
 
-fn main() {
-    let mut ring_buffer = DualRingBuffer::<64>::new_server("/dev/shm/pingpong")
-        .expect("failed to create DualRingBuffer");
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut listener = StdListener::new("/dev/shm/pingpong/")?;
 
-    let mut buf = vec![0u8; 4];
-    let mut start = Instant::now();
-    let rounds = 1000000;
-    for i in 0..rounds + 1 {
-        if i == 1 {
-            start = Instant::now();
+    loop {
+        let (client_metadata, mut ring_buffer) =
+            listener.accept(|metadata| metadata.uid() == 1000)?;
+
+        // ring_buffer.set_timeout(Some(Duration::from_secs(30)));
+
+        eprintln!(
+            "Accepted connection from uid={}, gid={}",
+            client_metadata.uid(),
+            client_metadata.gid()
+        );
+
+        let mut buf = [0u8; 4];
+        loop {
+            if let Err(e) = ring_buffer.write_all(b"ping") {
+                eprintln!("Error writing to ring buffer: {}", e);
+                break;
+            }
+
+            if let Err(e) = ring_buffer.read_exact(&mut buf) {
+                eprintln!("Error reading from ring buffer: {}", e);
+                break;
+            }
+
+            if buf == *b"gbye" {
+                eprintln!("Client said goodbye, closing connection");
+                break;
+            }
         }
-
-        buf.copy_from_slice("ping".as_bytes());
-        ring_buffer
-            .write_all(buf.as_slice())
-            .expect("failed to write to ring buffer");
-
-        ring_buffer
-            .read_exact(buf.as_mut_slice())
-            .expect("failed to read from ring buffer");
     }
-
-    let avg = start.elapsed().as_nanos() / rounds;
-    eprintln!("Average round-trip time: {} ns", avg);
 }
