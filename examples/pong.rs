@@ -2,14 +2,13 @@ use std::{
     env,
     error::Error,
     io::{Read, Write},
-    thread,
     time::Instant,
 };
 
-use simple_shmem::{DualRingBuffers, StdDualRingBuffers};
+use simple_shmem::{FastDualRingBuffers, StdDualRingBuffers};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    const ROUNDS: usize = 10_000;
+    const ROUNDS: usize = 100_000;
 
     let spin_limit: u32 = env::args()
         .nth(1)
@@ -17,7 +16,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(1000);
 
     let mut start = Instant::now();
-    let mut ring_buffer = StdDualRingBuffers::connect("/dev/shm/pingpong")?;
+    let mut ring_buffer = FastDualRingBuffers::connect::<4088, _>("/dev/shm/pingpong")?;
     eprintln!("Connecting took {} µs", start.elapsed().as_micros());
 
     ring_buffer.set_spin_limit(spin_limit);
@@ -25,8 +24,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     start = Instant::now();
     let mut buf = [0u8; 4];
     for _ in 0..ROUNDS {
-        ring_buffer.read_exact(&mut buf)?;
-        ring_buffer.write_all(b"pong")?;
+        ring_buffer.read_fixed(&mut buf)?;
+        ring_buffer.write_fixed(b"pong")?;
     }
 
     eprintln!(
@@ -34,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         start.elapsed().as_nanos() / ROUNDS as u128
     );
 
-    ring_buffer.write_all(b"gbye")?;
+    ring_buffer.write_fixed(b"gbye")?;
 
     Ok(())
 }

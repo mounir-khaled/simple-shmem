@@ -66,10 +66,13 @@ impl<P: AsRef<Path>, const N: usize> Listener<P, N> {
         self.dual_ringbuffers.set_timeout(timeout);
     }
 
-    pub fn accept<F: FnOnce(&Metadata) -> bool>(
+    /// Accept a connection and return a data ring buffer with buffer size `DATA_N`.
+    /// The handshake always uses the listener's own `N`; only the returned data channel
+    /// changes size. Both sides must agree on `DATA_N` at compile time.
+    pub fn accept<const DATA_N: usize, F: FnOnce(&Metadata) -> bool>(
         &mut self,
         accept_fn: F,
-    ) -> Result<(Metadata, DualRingBuffers<N>), ConnectionError> {
+    ) -> Result<(Metadata, DualRingBuffers<DATA_N>), ConnectionError> {
         // TODO: add a timeout
         let mut peer_public_key_buf = [0u8; 65];
         self.dual_ringbuffers
@@ -118,7 +121,7 @@ impl<P: AsRef<Path>, const N: usize> Listener<P, N> {
             .open(&secret_server_path)
             .map_err(ConnectionError::Io)?;
 
-        let mut new_connection = DualRingBuffers::<N>::new_server(owned_file, shared_file)
+        let mut new_connection = DualRingBuffers::<DATA_N>::new_server(owned_file, shared_file)
             .map_err(ConnectionError::RingBufferError)?;
 
         self.dual_ringbuffers

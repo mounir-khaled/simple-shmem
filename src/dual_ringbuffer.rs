@@ -37,7 +37,12 @@ pub enum DualRingBuffersError {
 }
 
 impl<const N: usize> DualRingBuffers<N> {
-    pub fn connect<P: AsRef<Path>>(dir: P) -> Result<DualRingBuffers<N>, ConnectionError> {
+    /// Connect using `HANDSHAKE_N` for the handshake channel and `N` (Self) for the data channel.
+    /// Use this when the listener was created with a different buffer size for the handshake
+    /// than the desired data-channel buffer size (e.g. `HANDSHAKE_N = 4032`, `N = 56`).
+    pub fn connect<const HANDSHAKE_N: usize, P: AsRef<Path>>(
+        dir: P,
+    ) -> Result<DualRingBuffers<N>, ConnectionError> {
         let owned_path = dir.as_ref().join("client");
         let shared_path = dir.as_ref().join("server");
 
@@ -51,10 +56,10 @@ impl<const N: usize> DualRingBuffers<N> {
             .open(&shared_path)
             .map_err(ConnectionError::Io)?;
 
-        let mut conn_rb = DualRingBuffers::<N>::new_client(owned_file, conn_shared_file)
+        let mut conn_rb = DualRingBuffers::<HANDSHAKE_N>::new_client(owned_file, conn_shared_file)
             .map_err(ConnectionError::RingBufferError)?;
 
-        let secret_file_prefix = Self::key_agreement(&mut conn_rb)?;
+        let secret_file_prefix = conn_rb.key_agreement()?;
         let secret_file_prefix = hex::encode(secret_file_prefix);
         let mut owned_file_name = secret_file_prefix.clone();
         owned_file_name.push_str("-client");
@@ -213,5 +218,19 @@ impl<const N: usize> io::Write for DualRingBuffers<N> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.producer.flush()
+    }
+}
+
+impl<const N: usize> DualRingBuffers<N> {
+    /// Read exactly `LEN` bytes with a compile-time-known size so LLVM can
+    /// inline the copy as a direct load/store instead of a `memcpy` call.
+    pub fn read_fixed<const LEN: usize>(&mut self, buf: &mut [u8; LEN]) -> io::Result<()> {
+        self.consumer.read_fixed(buf)
+    }
+
+    /// Write exactly `LEN` bytes with a compile-time-known size so LLVM can
+    /// inline the copy as a direct load/store instead of a `memcpy` call.
+    pub fn write_fixed<const LEN: usize>(&mut self, buf: &[u8; LEN]) -> io::Result<()> {
+        self.producer.write_fixed(buf)
     }
 }

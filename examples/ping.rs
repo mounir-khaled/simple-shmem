@@ -1,12 +1,12 @@
+use std::env;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
-use std::{env, thread};
 
 use simple_shmem::{Listener, StdListener};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut listener = StdListener::new("/dev/shm/pingpong/")?;
+    let mut listener = Listener::<_, 4088>::new("/dev/shm/pingpong/")?;
 
     let spin_limit: u32 = env::args()
         .nth(1)
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         let (client_metadata, mut ring_buffer) =
-            listener.accept(|metadata| metadata.uid() == 1000)?;
+            listener.accept::<32, _>(|metadata| metadata.uid() == 1000)?;
 
         // ring_buffer.set_timeout(Some(Duration::from_secs(30)));
         ring_buffer.set_spin_limit(spin_limit);
@@ -28,12 +28,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let mut buf = [0u8; 4];
         loop {
-            if let Err(e) = ring_buffer.write_all(b"ping") {
+            if let Err(e) = ring_buffer.write_fixed(b"ping") {
                 eprintln!("Error writing to ring buffer: {}", e);
                 break;
             }
 
-            if let Err(e) = ring_buffer.read_exact(&mut buf) {
+            if let Err(e) = ring_buffer.read_fixed(&mut buf) {
                 eprintln!("Error reading from ring buffer: {}", e);
                 break;
             }

@@ -68,6 +68,74 @@ impl<const N: usize> Consumer<N> {
             (N as u32 - read_ptr + write_ptr) as usize
         }
     }
+
+    /// Read exactly `LEN` bytes, spinning until they are available.
+    ///
+    /// Unlike `io::Read::read`, the size is a compile-time constant so LLVM
+    /// inlines the memory copy as a direct register-width load/store instead
+    /// of an indirect `memcpy` call.
+    pub fn read_fixed<const LEN: usize>(&mut self, buf: &mut [u8; LEN]) -> io::Result<()> {
+        let owned = self.owned;
+        let readonly = self.readonly;
+        let read_ptr = owned.read_ptr().load(Ordering::Acquire);
+        let mut write_ptr = readonly.write_ptr().load(Ordering::Acquire);
+        let mut i = self.spin_limit;
+        while write_ptr == read_ptr {
+            if i == 0 {
+                owned.write_ptr_contended().store(1, Ordering::Release);
+                write_ptr = readonly.write_ptr().load(Ordering::Acquire);
+                if write_ptr == read_ptr {
+                    if let Err(e) = readonly
+                        .write_ptr()
+                        .wait(write_ptr, self.timeout.as_ref())
+                    {
+                        owned.write_ptr_contended().store(0, Ordering::Release);
+                        return Err(e);
+                    }
+                    write_ptr = readonly.write_ptr().load(Ordering::Acquire);
+                }
+            } else {
+                i -= 1;
+                hint::spin_loop();
+                write_ptr = readonly.write_ptr().load(Ordering::Acquire);
+            }
+        }
+        if i == 0 {
+            owned.write_ptr_contended().store(0, Ordering::Release);
+        }
+        let read_ptr_usize = read_ptr as usize;
+        let buffer = readonly.buffer();
+        if read_ptr_usize + LEN <= N {
+            // LEN is a compile-time constant: LLVM emits an inline register-width copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.as_ptr().add(read_ptr_usize),
+                    buf.as_mut_ptr(),
+                    LEN,
+                );
+            }
+        } else {
+            let first_part_len = N - read_ptr_usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.as_ptr().add(read_ptr_usize),
+                    buf.as_mut_ptr(),
+                    first_part_len,
+                );
+                std::ptr::copy_nonoverlapping(
+                    buffer.as_ptr(),
+                    buf.as_mut_ptr().add(first_part_len),
+                    LEN - first_part_len,
+                );
+            }
+        }
+        let new_read_ptr = ((read_ptr_usize + LEN) % N) as u32;
+        owned.read_ptr().store(new_read_ptr, Ordering::Release);
+        if readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
+            owned.read_ptr().wake_one()?;
+        }
+        Ok(())
+    }
 }
 
 impl<const N: usize> Drop for Consumer<N> {
@@ -79,46 +147,43 @@ impl<const N: usize> Drop for Consumer<N> {
 
 impl<const N: usize> io::Read for Consumer<N> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut read_ptr = self.owned.read_ptr().load(Ordering::Acquire);
-        let mut write_ptr = self.readonly.write_ptr().load(Ordering::Acquire);
-        let mut bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
+        // Cache the two pointers in locals so LLVM can keep them in registers
+        // across the spin loop rather than reloading through &mut self every iteration.
+        let owned = self.owned;
+        let readonly = self.readonly;
+        let mut read_ptr = owned.read_ptr().load(Ordering::Acquire);
+        let mut write_ptr = readonly.write_ptr().load(Ordering::Acquire);
         let mut i = self.spin_limit;
-        while bytes_read == 0 {
-            // spin for a while before sleeping to reduce latency in the case of short waits
+        // Spin until write_ptr != read_ptr (buffer non-empty).
+        // read_ptr is owned by this consumer and does not change during the spin.
+        while write_ptr == read_ptr {
             if i == 0 {
-                self.owned.write_ptr_contended().store(1, Ordering::Release);
-                // Re-check write_ptr AFTER the Release store. If the writer updated
-                // write_ptr and then read the flag (seeing 0) before our store, we will
-                // see the new write_ptr here and skip the sleep, preventing a missed wake.
-                write_ptr = self.readonly.write_ptr().load(Ordering::Acquire);
-                bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
-                if bytes_read == 0 {
-                    if let Err(e) = self
-                        .readonly
+                owned.write_ptr_contended().store(1, Ordering::Release);
+                write_ptr = readonly.write_ptr().load(Ordering::Acquire);
+                if write_ptr == read_ptr {
+                    if let Err(e) = readonly
                         .write_ptr()
                         .wait(write_ptr, self.timeout.as_ref())
                     {
-                        // Clear the flag before returning so it is not left permanently set,
-                        // which would cause unnecessary wake_one calls on every future write.
-                        self.owned.write_ptr_contended().store(0, Ordering::Release);
+                        owned.write_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
+                    write_ptr = readonly.write_ptr().load(Ordering::Acquire);
                 }
             } else {
                 i -= 1;
                 hint::spin_loop();
+                write_ptr = readonly.write_ptr().load(Ordering::Acquire);
             }
-
-            read_ptr = self.owned.read_ptr().load(Ordering::Acquire);
-            write_ptr = self.readonly.write_ptr().load(Ordering::Acquire);
-            bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
         }
 
         if i == 0 {
-            self.owned.write_ptr_contended().store(0, Ordering::Release);
+            owned.write_ptr_contended().store(0, Ordering::Release);
         }
 
-        let buffer = self.readonly.buffer();
+        let bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
+
+        let buffer = readonly.buffer();
         let read_ptr_usize = read_ptr as usize;
         if read_ptr_usize + bytes_read <= N {
             buf[..bytes_read]
@@ -131,10 +196,10 @@ impl<const N: usize> io::Read for Consumer<N> {
         }
 
         read_ptr = ((read_ptr_usize + bytes_read) % N) as u32;
-        self.owned.read_ptr().store(read_ptr, Ordering::Release);
+        owned.read_ptr().store(read_ptr, Ordering::Release);
 
-        if self.readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
-            self.owned.read_ptr().wake_one()?;
+        if readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
+            owned.read_ptr().wake_one()?;
         }
 
         Ok(bytes_read)
@@ -181,6 +246,74 @@ impl<const N: usize> Producer<N> {
             (N as u32 - read_ptr + write_ptr) as usize
         }
     }
+
+    /// Write exactly `LEN` bytes, spinning until space is available.
+    ///
+    /// Unlike `io::Write::write`, the size is a compile-time constant so LLVM
+    /// inlines the memory copy as a direct register-width load/store instead
+    /// of an indirect `memcpy` call.
+    pub fn write_fixed<const LEN: usize>(&mut self, buf: &[u8; LEN]) -> io::Result<()> {
+        let owned = self.owned;
+        let readonly = self.readonly;
+        let write_ptr = owned.write_ptr().load(Ordering::Acquire);
+        let mut read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+        let mut i = self.spin_limit;
+        while Self::empty_space(read_ptr, write_ptr) < LEN {
+            if i == 0 {
+                owned.read_ptr_contended().store(1, Ordering::Release);
+                read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                if Self::empty_space(read_ptr, write_ptr) < LEN {
+                    if let Err(e) = readonly
+                        .read_ptr()
+                        .wait(read_ptr, self.timeout.as_ref())
+                    {
+                        owned.read_ptr_contended().store(0, Ordering::Release);
+                        return Err(e);
+                    }
+                    read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                }
+            } else {
+                i -= 1;
+                hint::spin_loop();
+                read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+            }
+        }
+        if i == 0 {
+            owned.read_ptr_contended().store(0, Ordering::Release);
+        }
+        let write_ptr_usize = write_ptr as usize;
+        let buffer = owned.buffer_mut();
+        if write_ptr_usize + LEN <= N {
+            // LEN is a compile-time constant: LLVM emits an inline register-width copy.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    buffer.as_mut_ptr().add(write_ptr_usize),
+                    LEN,
+                );
+            }
+        } else {
+            let first_part_len = N - write_ptr_usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    buffer.as_mut_ptr().add(write_ptr_usize),
+                    first_part_len,
+                );
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(first_part_len),
+                    buffer.as_mut_ptr(),
+                    LEN - first_part_len,
+                );
+            }
+        }
+        let new_write_ptr = ((write_ptr_usize + LEN) % N) as u32;
+        owned.write_ptr().store(new_write_ptr, Ordering::Release);
+        if readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
+            owned.write_ptr().wake_one()?;
+        }
+        Ok(())
+    }
 }
 
 impl<const N: usize> Drop for Producer<N> {
@@ -192,46 +325,45 @@ impl<const N: usize> Drop for Producer<N> {
 
 impl<const N: usize> io::Write for Producer<N> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut write_ptr = self.owned.write_ptr().load(Ordering::Acquire);
-        let mut read_ptr = self.readonly.read_ptr().load(Ordering::Acquire);
+        // Cache the two pointers in locals so LLVM can keep them in registers
+        // across the spin loop rather than reloading through &mut self every iteration.
+        let owned = self.owned;
+        let readonly = self.readonly;
+        let write_ptr = owned.write_ptr().load(Ordering::Acquire);
+        let mut read_ptr = readonly.read_ptr().load(Ordering::Acquire);
         let mut bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
         let mut i = self.spin_limit;
+        // Spin until the consumer frees enough space.
+        // write_ptr is owned by this producer and does not change during the spin.
         while bytes_written == 0 {
-            // spin for a while before sleeping to reduce latency in the case of short waits
             if i == 0 {
-                self.owned.read_ptr_contended().store(1, Ordering::Release);
-                // Re-check read_ptr AFTER the Release store. If the reader advanced
-                // read_ptr and then read the flag (seeing 0) before our store, we will
-                // see the new read_ptr here and skip the sleep, preventing a missed wake.
-                read_ptr = self.readonly.read_ptr().load(Ordering::Acquire);
+                owned.read_ptr_contended().store(1, Ordering::Release);
+                read_ptr = readonly.read_ptr().load(Ordering::Acquire);
                 bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
                 if bytes_written == 0 {
-                    if let Err(e) = self
-                        .readonly
+                    if let Err(e) = readonly
                         .read_ptr()
                         .wait(read_ptr, self.timeout.as_ref())
                     {
-                        // Clear the flag before returning so it is not left permanently set,
-                        // which would cause unnecessary wake_one calls on every future read.
-                        self.owned.read_ptr_contended().store(0, Ordering::Release);
+                        owned.read_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
+                    read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                    bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
                 }
             } else {
                 i -= 1;
                 hint::spin_loop();
+                read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
             }
-
-            write_ptr = self.owned.write_ptr().load(Ordering::Acquire);
-            read_ptr = self.readonly.read_ptr().load(Ordering::Acquire);
-            bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
         }
 
         if i == 0 {
-            self.owned.read_ptr_contended().store(0, Ordering::Release);
+            owned.read_ptr_contended().store(0, Ordering::Release);
         }
 
-        let buffer = self.owned.buffer_mut();
+        let buffer = owned.buffer_mut();
         let write_ptr_usize = write_ptr as usize;
         if write_ptr_usize + bytes_written <= N {
             buffer[write_ptr_usize..(write_ptr_usize + bytes_written)]
@@ -243,11 +375,11 @@ impl<const N: usize> io::Write for Producer<N> {
                 .copy_from_slice(&buf[first_part_len..bytes_written]);
         }
 
-        write_ptr = ((write_ptr_usize + bytes_written) % N) as u32;
-        self.owned.write_ptr().store(write_ptr, Ordering::Release);
+        let write_ptr = ((write_ptr_usize + bytes_written) % N) as u32;
+        owned.write_ptr().store(write_ptr, Ordering::Release);
 
-        if self.readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
-            self.owned.write_ptr().wake_one()?;
+        if readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
+            owned.write_ptr().wake_one()?;
         }
 
         Ok(bytes_written)

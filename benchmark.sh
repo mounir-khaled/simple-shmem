@@ -16,7 +16,7 @@ pong_measure() {
     local pong_spin=$2
     local label=$3
     printf "  CPU %2d %-30s" "$pong_cpu" "$label"
-    taskset -c "$pong_cpu" strace -o /tmp/pong.$pong_cpu.strace ./target/release/examples/pong "$pong_spin" 2>&1 \
+    taskset -c "$pong_cpu" ./target/release/examples/pong "$pong_spin" 2>&1 \
         | grep "Average" | sed 's/Average round-trip time: //'
 }
 
@@ -34,15 +34,22 @@ run_pass() {
     local ping_pid=$!
     sleep 0.5
 
-    for i in {0..19}; do
-        if [ "$i" -eq "$CPU" ]; then
-            pong_measure $i "$pong_spin" "(same CPU)"
-        elif [ -n "$SIBLING" ] && [ "$i" -eq "$SIBLING" ]; then
-            pong_measure $i "$pong_spin" "(hyperthread sibling)"
-        else
-            pong_measure $i "$pong_spin" ""
+    if [ "$cpus_to_test" = "focused" ]; then
+        pong_measure $CPU          "$pong_spin" "(same CPU)"
+        if [ -n "$SIBLING" ]; then
+            pong_measure $SIBLING "$pong_spin" "(hyperthread sibling)"
         fi
-    done
+    else
+        for i in {0..19}; do
+            if [ "$i" -eq "$CPU" ]; then
+                pong_measure $i "$pong_spin" "(same CPU)"
+            elif [ -n "$SIBLING" ] && [ "$i" -eq "$SIBLING" ]; then
+                pong_measure $i "$pong_spin" "(hyperthread sibling)"
+            else
+                pong_measure $i "$pong_spin" ""
+            fi
+        done
+    fi
 
     kill $ping_pid 2>/dev/null
     wait $ping_pid 2>/dev/null || true
