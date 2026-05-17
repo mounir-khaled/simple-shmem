@@ -4,11 +4,13 @@ use thiserror::Error;
 
 use crate::ringbuffer_parts::{ConsumerOwned, ProducerOwned, munmap};
 
-const SPIN_LIMIT: u32 = 100;
+const DEFAULT_SPIN_LIMIT: u32 = 100;
 
 /// A ring buffer that can only write data
 pub struct Producer<const N: usize> {
     timeout: Option<Duration>,
+    /// Total number of spin iterations before sleeping via futex.
+    spin_limit: u32,
     owned: &'static ProducerOwned<N>,
     readonly: &'static ConsumerOwned<N>,
 }
@@ -16,6 +18,8 @@ pub struct Producer<const N: usize> {
 /// A ring buffer that can only read data
 pub struct Consumer<const N: usize> {
     timeout: Option<Duration>,
+    /// Total number of spin iterations before sleeping via futex.
+    spin_limit: u32,
     owned: &'static ConsumerOwned<N>,
     readonly: &'static ProducerOwned<N>,
 }
@@ -43,6 +47,7 @@ impl<const N: usize> Consumer<N> {
 
         Ok(Self {
             timeout: None,
+            spin_limit: DEFAULT_SPIN_LIMIT,
             owned,
             readonly,
         })
@@ -50,6 +55,10 @@ impl<const N: usize> Consumer<N> {
 
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
+    }
+
+    pub fn set_spin_limit(&mut self, spin_limit: u32) {
+        self.spin_limit = spin_limit;
     }
 
     fn len(read_ptr: u32, write_ptr: u32) -> usize {
@@ -73,18 +82,15 @@ impl<const N: usize> io::Read for Consumer<N> {
         let mut read_ptr = self.owned.read_ptr().load(Ordering::Acquire);
         let mut write_ptr = self.readonly.write_ptr().load(Ordering::Acquire);
         let mut bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
-        let mut i = SPIN_LIMIT;
+        let mut i = self.spin_limit;
         while bytes_read == 0 {
             // spin for a while before sleeping to reduce latency in the case of short waits
             if i == 0 {
-                self.owned.write_ptr_contended().store(1, Ordering::SeqCst);
-                // Re-check write_ptr AFTER the SeqCst store. If the writer updated
+                self.owned.write_ptr_contended().store(1, Ordering::Release);
+                // Re-check write_ptr AFTER the Release store. If the writer updated
                 // write_ptr and then read the flag (seeing 0) before our store, we will
                 // see the new write_ptr here and skip the sleep, preventing a missed wake.
-                // SeqCst is required (not just Acquire) so that this load participates in
-                // the global SeqCst total order and cannot be reordered past the store above
-                // on weakly-ordered architectures.
-                write_ptr = self.readonly.write_ptr().load(Ordering::SeqCst);
+                write_ptr = self.readonly.write_ptr().load(Ordering::Acquire);
                 bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
                 if bytes_read == 0 {
                     if let Err(e) = self
@@ -94,7 +100,7 @@ impl<const N: usize> io::Read for Consumer<N> {
                     {
                         // Clear the flag before returning so it is not left permanently set,
                         // which would cause unnecessary wake_one calls on every future write.
-                        self.owned.write_ptr_contended().store(0, Ordering::SeqCst);
+                        self.owned.write_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
                 }
@@ -109,7 +115,7 @@ impl<const N: usize> io::Read for Consumer<N> {
         }
 
         if i == 0 {
-            self.owned.write_ptr_contended().store(0, Ordering::SeqCst);
+            self.owned.write_ptr_contended().store(0, Ordering::Release);
         }
 
         let buffer = self.readonly.buffer();
@@ -125,13 +131,9 @@ impl<const N: usize> io::Read for Consumer<N> {
         }
 
         read_ptr = ((read_ptr_usize + bytes_read) % N) as u32;
-        // SeqCst prevents the store from being reordered after the flag load below.
-        // Without this, the waker could read the flag before the pointer update is visible.
-        self.owned.read_ptr().store(read_ptr, Ordering::SeqCst);
+        self.owned.read_ptr().store(read_ptr, Ordering::Release);
 
-        // SeqCst ensures this load is ordered after the SeqCst store to read_ptr above,
-        // preventing a missed wake on weakly-ordered architectures.
-        if self.readonly.read_ptr_contended().load(Ordering::SeqCst) != 0 {
+        if self.readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
             self.owned.read_ptr().wake_one()?;
         }
 
@@ -154,6 +156,7 @@ impl<const N: usize> Producer<N> {
 
         Ok(Self {
             timeout: None,
+            spin_limit: DEFAULT_SPIN_LIMIT,
             owned,
             readonly,
         })
@@ -161,6 +164,10 @@ impl<const N: usize> Producer<N> {
 
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
+    }
+
+    pub fn set_spin_limit(&mut self, spin_limit: u32) {
+        self.spin_limit = spin_limit;
     }
 
     fn empty_space(read_ptr: u32, write_ptr: u32) -> usize {
@@ -188,18 +195,15 @@ impl<const N: usize> io::Write for Producer<N> {
         let mut write_ptr = self.owned.write_ptr().load(Ordering::Acquire);
         let mut read_ptr = self.readonly.read_ptr().load(Ordering::Acquire);
         let mut bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
-        let mut i = SPIN_LIMIT;
+        let mut i = self.spin_limit;
         while bytes_written == 0 {
             // spin for a while before sleeping to reduce latency in the case of short waits
             if i == 0 {
-                self.owned.read_ptr_contended().store(1, Ordering::SeqCst);
-                // Re-check read_ptr AFTER the SeqCst store. If the reader advanced
+                self.owned.read_ptr_contended().store(1, Ordering::Release);
+                // Re-check read_ptr AFTER the Release store. If the reader advanced
                 // read_ptr and then read the flag (seeing 0) before our store, we will
                 // see the new read_ptr here and skip the sleep, preventing a missed wake.
-                // SeqCst is required (not just Acquire) so that this load participates in
-                // the global SeqCst total order and cannot be reordered past the store above
-                // on weakly-ordered architectures.
-                read_ptr = self.readonly.read_ptr().load(Ordering::SeqCst);
+                read_ptr = self.readonly.read_ptr().load(Ordering::Acquire);
                 bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
                 if bytes_written == 0 {
                     if let Err(e) = self
@@ -209,7 +213,7 @@ impl<const N: usize> io::Write for Producer<N> {
                     {
                         // Clear the flag before returning so it is not left permanently set,
                         // which would cause unnecessary wake_one calls on every future read.
-                        self.owned.read_ptr_contended().store(0, Ordering::SeqCst);
+                        self.owned.read_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
                 }
@@ -224,7 +228,7 @@ impl<const N: usize> io::Write for Producer<N> {
         }
 
         if i == 0 {
-            self.owned.read_ptr_contended().store(0, Ordering::SeqCst);
+            self.owned.read_ptr_contended().store(0, Ordering::Release);
         }
 
         let buffer = self.owned.buffer_mut();
@@ -240,13 +244,9 @@ impl<const N: usize> io::Write for Producer<N> {
         }
 
         write_ptr = ((write_ptr_usize + bytes_written) % N) as u32;
-        // SeqCst prevents the store from being reordered after the flag load below.
-        // Without this, the waker could read the flag before the pointer update is visible.
-        self.owned.write_ptr().store(write_ptr, Ordering::SeqCst);
+        self.owned.write_ptr().store(write_ptr, Ordering::Release);
 
-        // SeqCst ensures this load is ordered after the SeqCst store to write_ptr above,
-        // preventing a missed wake on weakly-ordered architectures.
-        if self.readonly.write_ptr_contended().load(Ordering::SeqCst) != 0 {
+        if self.readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
             self.owned.write_ptr().wake_one()?;
         }
 

@@ -155,6 +155,11 @@ impl<const N: usize> DualRingBuffers<N> {
         self.producer.set_timeout(timeout);
     }
 
+    pub fn set_spin_limit(&mut self, spin_limit: u32) {
+        self.consumer.set_spin_limit(spin_limit);
+        self.producer.set_spin_limit(spin_limit);
+    }
+
     fn key_agreement(&mut self) -> Result<[u8; 32], ConnectionError> {
         let rng = ring::rand::SystemRandom::new();
         let my_private_key = agreement::EphemeralPrivateKey::generate(KEX_ALG, &rng)

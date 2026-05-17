@@ -34,10 +34,6 @@ pub unsafe fn munmap<T>(ptr: *const T) -> io::Result<()> {
 /// Ring buffer part that is owned by the producer.
 /// This gets mmapped into the producer as read-write
 /// and into the consumer as read-only
-///
-/// Layout: control fields occupy exactly one 64-byte cache line, and the
-/// buffer starts on the next cache line.  This prevents buffer writes from
-/// invalidating the cache line that the consumer spins on (write_ptr).
 #[repr(C)]
 pub struct ProducerOwned<const N: usize> {
     write_ptr: Futex,

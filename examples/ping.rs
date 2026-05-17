@@ -1,17 +1,24 @@
 use std::error::Error;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
+use std::{env, thread};
 
-use simple_shmem::StdListener;
+use simple_shmem::{Listener, StdListener};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut listener = StdListener::new("/dev/shm/pingpong/")?;
+
+    let spin_limit: u32 = env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
 
     loop {
         let (client_metadata, mut ring_buffer) =
             listener.accept(|metadata| metadata.uid() == 1000)?;
 
         // ring_buffer.set_timeout(Some(Duration::from_secs(30)));
+        ring_buffer.set_spin_limit(spin_limit);
 
         eprintln!(
             "Accepted connection from uid={}, gid={}",
