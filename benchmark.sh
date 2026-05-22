@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-CPU=5
+CPU=10
 SIBLING=$(cat /sys/devices/system/cpu/cpu${CPU}/topology/thread_siblings_list \
     | tr ',' '\n' \
     | awk -F'-' 'NF==2{for(i=$1;i<=$2;i++) print i} NF==1{print $1}' \

@@ -1,25 +1,34 @@
 use std::{
-    fs::{File, remove_file},
-    io::{self, Read, Write},
-    os::fd::AsFd,
-    path::Path,
+    fs::File,
+    io,
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
+        raw::c_void,
+        unix::net::{UnixDatagram, UnixStream},
+    },
+    ptr,
     time::Duration,
 };
 
-use ring::{agreement, hkdf};
+use libc::{CMSG_FIRSTHDR, CMSG_NXTHDR};
 use thiserror::Error;
 
 use crate::{
-    ConnectionError, KEX_ALG, owned_file_options,
+    parse_fd_cmsg, parse_ucred_cmsg,
     producer_consumer::{Consumer, ConsumerProducerError, Producer},
     ringbuffer_parts::ProducerOwned,
-    shared_file_options,
+    send_file_descriptor, sockaddr_un_from_str,
 };
 
 // TODO: implement Drop and delete owned file
 pub struct DualRingBuffers<const N: usize> {
     consumer: Consumer<N>,
     producer: Producer<N>,
+}
+
+enum FileOrder {
+    ConsumerFirst,
+    ProducerFirst,
 }
 
 #[derive(Error, Debug)]
@@ -37,120 +46,150 @@ pub enum DualRingBuffersError {
 }
 
 impl<const N: usize> DualRingBuffers<N> {
-    /// Connect using `HANDSHAKE_N` for the handshake channel and `N` (Self) for the data channel.
-    /// Use this when the listener was created with a different buffer size for the handshake
-    /// than the desired data-channel buffer size (e.g. `HANDSHAKE_N = 4032`, `N = 56`).
-    pub fn connect<const HANDSHAKE_N: usize, P: AsRef<Path>>(
-        dir: P,
-    ) -> Result<DualRingBuffers<N>, ConnectionError> {
-        let owned_path = dir.as_ref().join("client");
-        let shared_path = dir.as_ref().join("server");
+    pub fn connect<A: FnOnce(u32, u32) -> bool>(
+        uds: &mut UnixDatagram,
+        server_name: &str,
+        accept_fn: A,
+    ) -> Result<Self, DualRingBuffersError> {
+        const TRUE: i32 = 1;
+        let status_isize;
+        let status_int;
 
-        let owned_file = owned_file_options()
-            .create_new(false)
-            .truncate(false)
-            .open(&owned_path)
-            .map_err(ConnectionError::Io)?;
+        {
+            let uds_fd = uds.as_fd();
+            status_int = unsafe {
+                libc::setsockopt(
+                    uds_fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    ptr::from_ref(&TRUE) as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as _,
+                )
+            };
+        }
 
-        let conn_shared_file = shared_file_options()
-            .open(&shared_path)
-            .map_err(ConnectionError::Io)?;
+        if status_int == -1 {
+            return Err(DualRingBuffersError::OwnedFile(io::Error::last_os_error()));
+        }
 
-        let mut conn_rb = DualRingBuffers::<HANDSHAKE_N>::new_client(owned_file, conn_shared_file)
-            .map_err(ConnectionError::RingBufferError)?;
+        let owned_file = Self::owned_memfd()?;
 
-        let secret_file_prefix = conn_rb.key_agreement()?;
-        let secret_file_prefix = hex::encode(secret_file_prefix);
-        let mut owned_file_name = secret_file_prefix.clone();
-        owned_file_name.push_str("-client");
-        let owned_file_path = dir.as_ref().join(owned_file_name);
+        let (server_addr, _) =
+            sockaddr_un_from_str(server_name).map_err(DualRingBuffersError::SharedFile)?;
 
-        let owned_file = owned_file_options()
-            .open(&owned_file_path)
-            .map_err(ConnectionError::Io)?;
+        send_file_descriptor(uds, &server_addr, owned_file.as_raw_fd())
+            .map_err(DualRingBuffersError::OwnedFile)?;
 
-        // Resize before signaling ready so the server can safely mmap this file
-        owned_file
-            .set_len(ProducerOwned::<N>::page_aligned_size() as u64 * 2)
-            .map_err(ConnectionError::Io)?;
+        let mut cmsg_buffer = [0u8; 4096];
 
-        conn_rb.write_all(&[1]).map_err(ConnectionError::Io)?;
+        let mut buf = [0u8; 1];
 
-        let mut server_ready = [0u8; 1];
-        conn_rb
-            .read_exact(&mut server_ready)
-            .map_err(ConnectionError::Io)?;
+        let iovec = libc::iovec {
+            iov_base: ptr::from_mut(&mut buf) as *mut c_void,
+            iov_len: 1,
+        };
 
-        if server_ready[0] != 1 {
-            return Err(ConnectionError::Io(io::Error::new(
-                io::ErrorKind::Other,
-                "server failed to create owned file",
+        let mut msghdr = libc::msghdr {
+            msg_name: ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &iovec as *const libc::iovec as *mut libc::iovec,
+            msg_iovlen: 1,
+            msg_control: ptr::from_mut(&mut cmsg_buffer) as *mut libc::c_void,
+            msg_controllen: cmsg_buffer.len() as _,
+            msg_flags: 0,
+        };
+
+        let uds_fd = uds.as_fd();
+        status_isize = unsafe { libc::recvmsg(uds_fd.as_raw_fd(), &mut msghdr, 0) };
+        if status_isize == -1 {
+            return Err(DualRingBuffersError::SharedFile(io::Error::last_os_error()));
+        }
+
+        let ucred_hdr = unsafe { libc::CMSG_FIRSTHDR(&msghdr).as_mut() };
+        let Some(ucred_hdr) = ucred_hdr else {
+            return Err(DualRingBuffersError::SharedFile(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No control message received",
+            )));
+        };
+
+        let ucred = parse_ucred_cmsg(ucred_hdr).map_err(DualRingBuffersError::SharedFile)?;
+        if !accept_fn(ucred.uid, ucred.gid) {
+            return Err(DualRingBuffersError::SharedFile(io::Error::from(
+                io::ErrorKind::PermissionDenied,
             )));
         }
 
-        remove_file(owned_file_path).map_err(ConnectionError::Io)?;
+        let fd_hdr = unsafe { libc::CMSG_NXTHDR(&msghdr, ucred_hdr).as_mut() };
+        let Some(fd_hdr) = fd_hdr else {
+            return Err(DualRingBuffersError::SharedFile(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No file descriptor control message received",
+            )));
+        };
 
-        let mut secret_server_name = secret_file_prefix.clone();
-        secret_server_name.push_str("-server");
-        let secret_server_path = dir.as_ref().join(secret_server_name);
-        let shared_file = shared_file_options()
-            .open(&secret_server_path)
-            .map_err(ConnectionError::Io)?;
+        let shared_fd = parse_fd_cmsg(fd_hdr).map_err(DualRingBuffersError::SharedFile)?;
+        let shared_file = unsafe { File::from_raw_fd(shared_fd) };
 
-        let mut new_connection = DualRingBuffers::<N>::new_client(owned_file, shared_file)
-            .map_err(ConnectionError::RingBufferError)?;
-
-        new_connection
-            .write_all(&[1])
-            .map_err(ConnectionError::Io)?;
-
-        Ok(new_connection)
+        Self::new_producer_first(owned_file, shared_file)
     }
 
-    pub(crate) fn new_server(
+    pub fn new_consumer_first(
         owned_file: File,
         shared_file: File,
     ) -> Result<DualRingBuffers<N>, DualRingBuffersError> {
+        Self::new(owned_file, shared_file, FileOrder::ConsumerFirst)
+    }
+
+    pub fn new_producer_first(
+        owned_file: File,
+        shared_file: File,
+    ) -> Result<DualRingBuffers<N>, DualRingBuffersError> {
+        Self::new(owned_file, shared_file, FileOrder::ProducerFirst)
+    }
+
+    pub fn owned_memfd() -> Result<File, DualRingBuffersError> {
+        let owned_fd = unsafe { libc::memfd_create("\0".as_ptr() as *const i8, 0) };
+        if owned_fd == -1 {
+            return Err(DualRingBuffersError::OwnedFile(io::Error::last_os_error()));
+        }
+
+        let owned_file = unsafe { File::from_raw_fd(owned_fd) };
         let page_aligned_buffer_size = ProducerOwned::<N>::page_aligned_size();
 
         owned_file
             .set_len(page_aligned_buffer_size as u64 * 2)
             .map_err(DualRingBuffersError::OwnedFile)?;
 
-        let consumer = Consumer::new(owned_file.as_fd(), 0, shared_file.as_fd(), 0)
-            .map_err(DualRingBuffersError::Consumer)?;
-
-        let producer = Producer::new(
-            owned_file.as_fd(),
-            page_aligned_buffer_size,
-            shared_file.as_fd(),
-            page_aligned_buffer_size,
-        )
-        .map_err(DualRingBuffersError::Producer)?;
-
-        Ok(DualRingBuffers { consumer, producer })
+        Ok(owned_file)
     }
 
-    pub(crate) fn new_client(
+    fn new(
         owned_file: File,
         shared_file: File,
+        order: FileOrder,
     ) -> Result<DualRingBuffers<N>, DualRingBuffersError> {
         let page_aligned_buffer_size = ProducerOwned::<N>::page_aligned_size();
-
-        owned_file
-            .set_len(page_aligned_buffer_size as u64 * 2)
-            .map_err(DualRingBuffersError::OwnedFile)?;
+        let (consumer_offset, producer_offset) = match order {
+            FileOrder::ConsumerFirst => (0, page_aligned_buffer_size),
+            FileOrder::ProducerFirst => (page_aligned_buffer_size, 0),
+        };
 
         let consumer = Consumer::new(
             owned_file.as_fd(),
-            page_aligned_buffer_size,
+            consumer_offset,
             shared_file.as_fd(),
-            page_aligned_buffer_size,
+            consumer_offset,
         )
         .map_err(DualRingBuffersError::Consumer)?;
 
-        let producer = Producer::new(owned_file.as_fd(), 0, shared_file.as_fd(), 0)
-            .map_err(DualRingBuffersError::Producer)?;
+        let producer = Producer::new(
+            owned_file.as_fd(),
+            producer_offset,
+            shared_file.as_fd(),
+            producer_offset,
+        )
+        .map_err(DualRingBuffersError::Producer)?;
 
         Ok(DualRingBuffers { consumer, producer })
     }
@@ -163,45 +202,6 @@ impl<const N: usize> DualRingBuffers<N> {
     pub fn set_spin_limit(&mut self, spin_limit: u32) {
         self.consumer.set_spin_limit(spin_limit);
         self.producer.set_spin_limit(spin_limit);
-    }
-
-    fn key_agreement(&mut self) -> Result<[u8; 32], ConnectionError> {
-        let rng = ring::rand::SystemRandom::new();
-        let my_private_key = agreement::EphemeralPrivateKey::generate(KEX_ALG, &rng)
-            .expect("failed to generate ephemeral private key");
-
-        let my_public_key = my_private_key
-            .compute_public_key()
-            .expect("failed to compute my public key");
-
-        self.write_all(my_public_key.as_ref())
-            .map_err(ConnectionError::Io)?;
-
-        let mut peer_public_key = [0u8; 65];
-        self.read_exact(&mut peer_public_key)
-            .map_err(ConnectionError::Io)?;
-
-        let peer_public_key = agreement::UnparsedPublicKey::new(KEX_ALG, peer_public_key);
-
-        let shared_secret =
-            agreement::agree_ephemeral(my_private_key, &peer_public_key, |key_material| {
-                let mut shared_secret = [0u8; 32];
-
-                let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[1, 2, 3, 4]);
-                let prk = salt.extract(key_material);
-
-                let okm = prk
-                    .expand(&[], &ring::aead::AES_256_GCM)
-                    .expect("failed to expand shared secret");
-
-                okm.fill(&mut shared_secret)
-                    .expect("failed to fill shared secret");
-
-                shared_secret
-            })
-            .map_err(ConnectionError::KeyAgreement)?;
-
-        Ok(shared_secret)
     }
 }
 

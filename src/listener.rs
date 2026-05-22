@@ -1,183 +1,111 @@
-use ring::{agreement, hkdf, rand};
-
-use crate::ConnectionError;
-use crate::ringbuffer_parts::ProducerOwned;
-use crate::umask_context::UmaskContext;
-use crate::{KEX_ALG, dual_ringbuffer::DualRingBuffers, owned_file_options, shared_file_options};
-use std::fs::{Metadata, remove_file};
-use std::os::unix::fs::OpenOptionsExt;
+use core::{slice, str};
 use std::{
-    fs::{DirBuilder, remove_dir_all},
-    io::{self, Read, Write},
-    os::unix::fs::DirBuilderExt,
-    path::Path,
+    fs::File,
+    intrinsics::copy_nonoverlapping,
+    io,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::net::UnixDatagram,
+    },
+    ptr,
 };
 
-pub struct Listener<P: AsRef<Path>, const N: usize> {
-    my_dir: P,
-    dual_ringbuffers: DualRingBuffers<N>,
-    rng: rand::SystemRandom,
-}
+use crate::{
+    DualRingBuffers, DualRingBuffersError, parse_fd_cmsg, parse_ucred_cmsg, send_file_descriptor,
+};
 
-impl<P: AsRef<Path>, const N: usize> Listener<P, N> {
-    pub fn new(dir: P) -> Result<Self, ConnectionError> {
-        let _ctx = UmaskContext::new(0).expect("umask lock poisoned");
-        let mut dir_builder = DirBuilder::new();
-        dir_builder.mode(0o1733);
+pub struct Listener(UnixDatagram);
 
-        if let Err(e) = dir_builder.create(&dir) {
-            if let io::ErrorKind::AlreadyExists = e.kind() {
-                remove_dir_all(&dir).map_err(ConnectionError::Dir)?;
-                dir_builder.create(&dir).map_err(ConnectionError::Dir)?;
-            } else {
-                return Err(ConnectionError::Dir(e));
-            }
+impl Listener {
+    pub fn new(uds: UnixDatagram) -> io::Result<Self> {
+        let passcred: libc::c_int = 1;
+        let passcred_ptr = ptr::from_ref(&passcred) as *const libc::c_void;
+        let passcred_size = std::mem::size_of_val(&passcred);
+        let passcred_size =
+            libc::socklen_t::try_from(passcred_size).expect("sizeof(c_int) cannot fit in a u32");
+
+        let uds_fd = uds.as_raw_fd();
+        let status = unsafe {
+            libc::setsockopt(
+                uds_fd,
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                passcred_ptr,
+                passcred_size,
+            )
+        };
+
+        if status == -1 {
+            return Err(io::Error::last_os_error());
         }
 
-        let owned_path = dir.as_ref().join("server");
-        let shared_path = dir.as_ref().join("client");
-
-        let owned_file = owned_file_options()
-            .open(&owned_path)
-            .map_err(ConnectionError::Io)?;
-
-        let shared_file = shared_file_options()
-            .write(true)
-            .create_new(true)
-            .mode(0o666)
-            .open(&shared_path)
-            .map_err(ConnectionError::Io)?;
-
-        shared_file
-            .set_len(ProducerOwned::<N>::page_aligned_size() as u64 * 2)
-            .map_err(ConnectionError::Io)?;
-
-        let dual_ringbuffers = DualRingBuffers::new_server(owned_file, shared_file)
-            .map_err(ConnectionError::RingBufferError)?;
-
-        Ok(Self {
-            my_dir: dir,
-            dual_ringbuffers,
-            rng: rand::SystemRandom::new(),
-        })
+        Ok(Self(uds))
     }
 
-    pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
-        self.dual_ringbuffers.set_timeout(timeout);
-    }
-
-    /// Accept a connection and return a data ring buffer with buffer size `DATA_N`.
-    /// The handshake always uses the listener's own `N`; only the returned data channel
-    /// changes size. Both sides must agree on `DATA_N` at compile time.
-    pub fn accept<const DATA_N: usize, F: FnOnce(&Metadata) -> bool>(
+    pub fn accept<A: FnOnce(u32, u32) -> bool, const N: usize>(
         &mut self,
-        accept_fn: F,
-    ) -> Result<(Metadata, DualRingBuffers<DATA_N>), ConnectionError> {
-        // TODO: add a timeout
-        let mut peer_public_key_buf = [0u8; 65];
-        self.dual_ringbuffers
-            .read_exact(&mut peer_public_key_buf)
-            .map_err(ConnectionError::Io)?;
+        accept_fn: A,
+    ) -> Result<DualRingBuffers<N>, DualRingBuffersError> {
+        let mut cmsg_buffer = [0u8; 4096];
 
-        // send our public key and derive the shared secret, which will be used as a prefix for the secret file paths
-        let secret_file_prefix = self.key_agreement(&peer_public_key_buf)?;
+        let mut buf = [0u8; 1];
 
-        // wait for client ready signal
-        // sent when the client creates the shared file
-        // at <my_dir>/<secret_file_prefix>-client
-        let mut ready_signal = [0u8; 1];
-        self.dual_ringbuffers
-            .read_exact(&mut ready_signal)
-            .map_err(ConnectionError::Io)?;
+        let iovec = libc::iovec {
+            iov_base: ptr::from_mut(&mut buf) as *mut libc::c_void,
+            iov_len: 1,
+        };
 
-        if ready_signal[0] != 1 {
-            return Err(ConnectionError::ClientError);
+        let mut dest_addr = libc::sockaddr_un {
+            sun_family: libc::AF_UNIX as libc::sa_family_t,
+            sun_path: [0; 108],
+        };
+
+        let mut msghdr = libc::msghdr {
+            msg_name: ptr::from_mut(&mut dest_addr) as *mut libc::c_void,
+            msg_namelen: std::mem::size_of_val(&dest_addr) as _,
+            msg_iov: &iovec as *const libc::iovec as *mut libc::iovec,
+            msg_iovlen: 1,
+            msg_control: ptr::from_mut(&mut cmsg_buffer) as *mut libc::c_void,
+            msg_controllen: cmsg_buffer.len() as _,
+            msg_flags: 0,
+        };
+
+        let status_isize = unsafe { libc::recvmsg(self.0.as_raw_fd(), &mut msghdr, 0) };
+        if status_isize == -1 {
+            return Err(DualRingBuffersError::SharedFile(io::Error::last_os_error()));
         }
 
-        let secret_file_prefix = hex::encode(&secret_file_prefix);
+        let ucred_hdr = unsafe { libc::CMSG_FIRSTHDR(&msghdr).as_mut() };
+        let Some(ucred_hdr) = ucred_hdr else {
+            return Err(DualRingBuffersError::SharedFile(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No ucred control message received",
+            )));
+        };
 
-        // open the file, check its ownership and decide whether to accept the connection
-        let mut secret_client_name = secret_file_prefix.clone();
-        secret_client_name.push_str("-client");
-        let secret_client_path = self.my_dir.as_ref().join(secret_client_name);
+        let fd_hdr = unsafe { libc::CMSG_NXTHDR(&msghdr, ucred_hdr).as_mut() };
+        let Some(fd_hdr) = fd_hdr else {
+            return Err(DualRingBuffersError::SharedFile(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No file descriptor control message received",
+            )));
+        };
 
-        let shared_file = shared_file_options()
-            .open(&secret_client_path)
-            .map_err(ConnectionError::Io)?;
-
-        let client_file_metadata = shared_file.metadata().map_err(|e| ConnectionError::Io(e))?;
-        if !accept_fn(&client_file_metadata) {
-            self.dual_ringbuffers
-                .write_all(&[0])
-                .map_err(ConnectionError::Io)?;
-
-            return Err(ConnectionError::PeerRejected(client_file_metadata));
+        let ucred = parse_ucred_cmsg(ucred_hdr).map_err(DualRingBuffersError::SharedFile)?;
+        if !accept_fn(ucred.uid, ucred.gid) {
+            return Err(DualRingBuffersError::SharedFile(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )));
         }
 
-        let mut secret_server_name = secret_file_prefix.clone();
-        secret_server_name.push_str("-server");
-        let secret_server_path = self.my_dir.as_ref().join(secret_server_name);
-        let owned_file = owned_file_options()
-            .open(&secret_server_path)
-            .map_err(ConnectionError::Io)?;
+        let shared_fd = parse_fd_cmsg(fd_hdr).map_err(DualRingBuffersError::SharedFile)?;
+        let shared_file = unsafe { File::from_raw_fd(shared_fd) };
 
-        let mut new_connection = DualRingBuffers::<DATA_N>::new_server(owned_file, shared_file)
-            .map_err(ConnectionError::RingBufferError)?;
+        let owned_file = DualRingBuffers::<N>::owned_memfd()?;
 
-        self.dual_ringbuffers
-            .write_all(&[1])
-            .map_err(ConnectionError::Io)?;
+        send_file_descriptor(&mut self.0, &dest_addr, owned_file.as_raw_fd())
+            .map_err(DualRingBuffersError::OwnedFile)?;
 
-        new_connection
-            .read_exact(&mut ready_signal)
-            .map_err(ConnectionError::Io)?;
-
-        if ready_signal[0] != 1 {
-            return Err(ConnectionError::ClientError);
-        }
-
-        remove_file(secret_server_path).map_err(ConnectionError::Io)?;
-
-        Ok((client_file_metadata, new_connection))
-    }
-
-    fn key_agreement(&mut self, peer_public_key: &[u8; 65]) -> Result<[u8; 32], ConnectionError> {
-        let peer_public_key = agreement::UnparsedPublicKey::new(KEX_ALG, peer_public_key);
-        let my_private_key = agreement::EphemeralPrivateKey::generate(KEX_ALG, &self.rng)
-            .expect("failed to generate ephemeral private key");
-
-        let my_public_key = my_private_key
-            .compute_public_key()
-            .expect("failed to compute my public key");
-
-        self.dual_ringbuffers
-            .write_all(my_public_key.as_ref())
-            .map_err(ConnectionError::Io)?;
-
-        let shared_secret =
-            agreement::agree_ephemeral(my_private_key, &peer_public_key, |key_material| {
-                let mut shared_secret = [0u8; 32];
-
-                let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[1, 2, 3, 4]);
-                let prk = salt.extract(key_material);
-
-                let okm = prk
-                    .expand(&[], &ring::aead::AES_256_GCM)
-                    .expect("failed to expand shared secret");
-
-                okm.fill(&mut shared_secret)
-                    .expect("failed to fill shared secret");
-
-                shared_secret
-            })
-            .map_err(ConnectionError::KeyAgreement)?;
-
-        Ok(shared_secret)
-    }
-}
-
-impl<P: AsRef<Path>, const N: usize> Drop for Listener<P, N> {
-    fn drop(&mut self) {
-        let _ = remove_dir_all(&self.my_dir);
+        DualRingBuffers::<N>::new_consumer_first(owned_file, shared_file)
     }
 }

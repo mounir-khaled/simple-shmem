@@ -1,12 +1,14 @@
-use std::env;
 use std::error::Error;
-use std::io::{Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixListener;
+use std::{env, os::unix::net::UnixDatagram};
 
-use simple_shmem::{Listener, StdListener};
+use simple_shmem::listener::Listener;
+use simple_shmem::{DualRingBuffers, FastDualRingBuffers};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut listener = Listener::<_, 4088>::new("/dev/shm/pingpong/")?;
+    // let mut listener = rb_listener::Listener::<_, 4088>::new("/dev/shm/pingpong/")?;
+    let listener = UnixDatagram::bind("/tmp/ping.sock")?;
+    let mut listener = Listener::new(listener)?;
 
     let spin_limit: u32 = env::args()
         .nth(1)
@@ -14,17 +16,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(1000);
 
     loop {
-        let (client_metadata, mut ring_buffer) =
-            listener.accept::<32, _>(|metadata| metadata.uid() == 1000)?;
+        let mut ring_buffer: FastDualRingBuffers = listener.accept(|uid, _| uid == 1000)?;
 
         // ring_buffer.set_timeout(Some(Duration::from_secs(30)));
         ring_buffer.set_spin_limit(spin_limit);
-
-        eprintln!(
-            "Accepted connection from uid={}, gid={}",
-            client_metadata.uid(),
-            client_metadata.gid()
-        );
 
         let mut buf = [0u8; 4];
         loop {
@@ -42,6 +37,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Client said goodbye, closing connection");
                 break;
             }
+
+            assert_eq!(&buf, b"pong");
         }
     }
 }
