@@ -1,12 +1,6 @@
-use std::{
-    env,
-    error::Error,
-    io::{Read, Write},
-    os::unix::net::{UnixDatagram, UnixStream},
-    time::Instant,
-};
+use std::{env, error::Error, os::unix::net::UnixDatagram, time::Instant};
 
-use simple_shmem::{FastDualRingBuffers, StdDualRingBuffers};
+use simple_shmem::FastDualRingBuffers;
 
 fn main() -> Result<(), Box<dyn Error>> {
     const ROUNDS: usize = 100_000;
@@ -19,21 +13,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(1000);
 
     let mut start = Instant::now();
+    let mut ring_buffer =
+        FastDualRingBuffers::connect(&mut uds, "/tmp/ping.sock", |uid, _| uid == 1000 || uid == 0)?;
     eprintln!("Connecting took {} µs", start.elapsed().as_micros());
 
     start = Instant::now();
     let mut buf = [0u8; 4];
     for _ in 0..ROUNDS {
-        let mut ring_buffer =
-            FastDualRingBuffers::connect(&mut uds, "/tmp/ping.sock", |uid, _| {
-                uid == 1000 || uid == 0
-            })?;
-
         ring_buffer.set_spin_limit(spin_limit);
         ring_buffer.read_fixed(&mut buf)?;
         assert_eq!(&buf, b"ping");
         ring_buffer.write_fixed(b"pong")?;
-        ring_buffer.write_fixed(b"gbye")?;
     }
 
     eprintln!(
@@ -41,5 +31,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         start.elapsed().as_nanos() / ROUNDS as u128
     );
 
+    ring_buffer.write_fixed(b"gbye")?;
     Ok(())
 }

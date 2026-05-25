@@ -1,7 +1,5 @@
-use core::{slice, str};
 use std::{
     fs::File,
-    intrinsics::copy_nonoverlapping,
     io,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -101,9 +99,9 @@ impl Listener {
         let shared_fd = parse_fd_cmsg(fd_hdr).map_err(DualRingBuffersError::SharedFile)?;
         let shared_file = unsafe { File::from_raw_fd(shared_fd) };
 
-        let owned_file = DualRingBuffers::<N>::owned_memfd()?;
+        let (owned_file, shared) = DualRingBuffers::<N>::open_owned_and_shared("/dev/shm/")?;
 
-        send_file_descriptor(&mut self.0, &dest_addr, owned_file.as_raw_fd())
+        send_file_descriptor(&mut self.0, &dest_addr, shared.as_raw_fd())
             .map_err(DualRingBuffersError::OwnedFile)?;
 
         DualRingBuffers::<N>::new_consumer_first(owned_file, shared_file)

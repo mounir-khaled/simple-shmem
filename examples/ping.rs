@@ -1,9 +1,8 @@
 use std::error::Error;
-use std::os::unix::net::UnixListener;
 use std::{env, os::unix::net::UnixDatagram};
 
+use simple_shmem::FastDualRingBuffers;
 use simple_shmem::listener::Listener;
-use simple_shmem::{DualRingBuffers, FastDualRingBuffers};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // let mut listener = rb_listener::Listener::<_, 4088>::new("/dev/shm/pingpong/")?;

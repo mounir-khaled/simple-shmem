@@ -1,16 +1,16 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io,
     os::{
-        fd::{AsFd, AsRawFd, FromRawFd, RawFd},
+        fd::{AsFd, AsRawFd, FromRawFd},
         raw::c_void,
-        unix::net::{UnixDatagram, UnixStream},
+        unix::{fs::OpenOptionsExt, net::UnixDatagram},
     },
+    path::Path,
     ptr,
     time::Duration,
 };
 
-use libc::{CMSG_FIRSTHDR, CMSG_NXTHDR};
 use thiserror::Error;
 
 use crate::{
@@ -72,12 +72,12 @@ impl<const N: usize> DualRingBuffers<N> {
             return Err(DualRingBuffersError::OwnedFile(io::Error::last_os_error()));
         }
 
-        let owned_file = Self::owned_memfd()?;
+        let (owned_file, shared) = Self::open_owned_and_shared("/dev/shm/")?;
 
         let (server_addr, _) =
             sockaddr_un_from_str(server_name).map_err(DualRingBuffersError::SharedFile)?;
 
-        send_file_descriptor(uds, &server_addr, owned_file.as_raw_fd())
+        send_file_descriptor(uds, &server_addr, shared.as_raw_fd())
             .map_err(DualRingBuffersError::OwnedFile)?;
 
         let mut cmsg_buffer = [0u8; 4096];
@@ -148,8 +148,28 @@ impl<const N: usize> DualRingBuffers<N> {
         Self::new(owned_file, shared_file, FileOrder::ProducerFirst)
     }
 
-    pub fn owned_memfd() -> Result<File, DualRingBuffersError> {
-        let owned_fd = unsafe { libc::memfd_create("\0".as_ptr() as *const i8, 0) };
+    pub(crate) fn open_owned_and_shared<P: AsRef<Path>>(
+        dir: P,
+    ) -> Result<(File, File), DualRingBuffersError> {
+        let template_path = dir.as_ref().join("drb.XXXXXX");
+        let template = template_path.to_str().ok_or_else(|| {
+            DualRingBuffersError::Dir(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Directory path is not valid UTF-8",
+            ))
+        })?;
+
+        let template = std::ffi::CString::new(template)
+            .map_err(|_| {
+                DualRingBuffersError::Dir(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Directory path contains interior null byte",
+                ))
+            })?
+            .into_raw();
+
+        let owned_fd = unsafe { libc::mkstemp(template) };
+        let tempfile_name = unsafe { std::ffi::CString::from_raw(template) };
         if owned_fd == -1 {
             return Err(DualRingBuffersError::OwnedFile(io::Error::last_os_error()));
         }
@@ -161,7 +181,16 @@ impl<const N: usize> DualRingBuffers<N> {
             .set_len(page_aligned_buffer_size as u64 * 2)
             .map_err(DualRingBuffersError::OwnedFile)?;
 
-        Ok(owned_file)
+        let tempfile_name = tempfile_name.to_str().expect("invalid UTF-8 from mkstemp");
+        let shared_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(tempfile_name)
+            .map_err(DualRingBuffersError::SharedFile)?;
+
+        std::fs::remove_file(tempfile_name).map_err(DualRingBuffersError::SharedFile)?;
+
+        Ok((owned_file, shared_file))
     }
 
     fn new(
@@ -170,6 +199,22 @@ impl<const N: usize> DualRingBuffers<N> {
         order: FileOrder,
     ) -> Result<DualRingBuffers<N>, DualRingBuffersError> {
         let page_aligned_buffer_size = ProducerOwned::<N>::page_aligned_size();
+
+        // Reject a truncated or malicious shared file from the peer before mapping it.
+        // Accessing a mapping that extends beyond the file's end causes SIGBUS, which
+        // bypasses all Rust error handling and crashes the process.
+        let shared_len = shared_file
+            .metadata()
+            .map_err(DualRingBuffersError::SharedFile)?
+            .len();
+        let required_len = page_aligned_buffer_size as u64 * 2;
+        if shared_len < required_len {
+            return Err(DualRingBuffersError::SharedFile(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shared file from peer is smaller than expected",
+            )));
+        }
+
         let (consumer_offset, producer_offset) = match order {
             FileOrder::ConsumerFirst => (0, page_aligned_buffer_size),
             FileOrder::ProducerFirst => (page_aligned_buffer_size, 0),

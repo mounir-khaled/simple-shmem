@@ -10,18 +10,14 @@ mod umask_context;
 pub mod listener;
 
 use std::{
-    fs::{Metadata, OpenOptions},
-    io::{self},
+    fs::Metadata,
+    io,
     os::{
         fd::{AsRawFd, RawFd},
-        unix::{
-            fs::OpenOptionsExt,
-            net::{SocketAddr, UnixDatagram},
-        },
+        unix::net::UnixDatagram,
     },
 };
 
-use libc::sockaddr_un;
 use thiserror::Error;
 
 pub use crate::dual_ringbuffer::{DualRingBuffers, DualRingBuffersError};

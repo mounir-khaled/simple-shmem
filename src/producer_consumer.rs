@@ -1,4 +1,9 @@
-use std::{cmp, hint, io, os::fd::BorrowedFd, sync::atomic::Ordering, time::Duration};
+use std::{
+    cmp, hint, io,
+    os::fd::BorrowedFd,
+    sync::atomic::{Ordering, fence},
+    time::Duration,
+};
 
 use thiserror::Error;
 
@@ -69,6 +74,13 @@ impl<const N: usize> Consumer<N> {
         }
     }
 
+    fn invalid_peer_ptr() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer sent out-of-range ring buffer pointer",
+        )
+    }
+
     /// Read exactly `LEN` bytes, spinning until they are available.
     ///
     /// Unlike `io::Read::read`, the size is a compile-time constant so LLVM
@@ -82,13 +94,12 @@ impl<const N: usize> Consumer<N> {
         let mut i = self.spin_limit;
         while write_ptr == read_ptr {
             if i == 0 {
-                owned.write_ptr_contended().store(1, Ordering::Release);
+                owned.write_ptr_contended().store(1, Ordering::Release); // SeqCst fence pairs with the SeqCst fence in Producer between
+                // store(write_ptr) and load(write_ptr_contended), preventing a lost wakeup.
+                fence(Ordering::SeqCst);
                 write_ptr = readonly.write_ptr().load(Ordering::Acquire);
                 if write_ptr == read_ptr {
-                    if let Err(e) = readonly
-                        .write_ptr()
-                        .wait(write_ptr, self.timeout.as_ref())
-                    {
+                    if let Err(e) = readonly.write_ptr().wait(write_ptr, self.timeout.as_ref()) {
                         owned.write_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
@@ -131,6 +142,11 @@ impl<const N: usize> Consumer<N> {
         }
         let new_read_ptr = ((read_ptr_usize + LEN) % N) as u32;
         owned.read_ptr().store(new_read_ptr, Ordering::Release);
+        // SeqCst fence pairs with the SeqCst fence in Producer between
+        // store(read_ptr_contended) and load(read_ptr), ensuring that either
+        // the producer sees the new read_ptr (and doesn't block) or we see
+        // read_ptr_contended=1 (and call wake_one), preventing a lost wakeup.
+        fence(Ordering::SeqCst);
         if readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
             owned.read_ptr().wake_one()?;
         }
@@ -159,12 +175,12 @@ impl<const N: usize> io::Read for Consumer<N> {
         while write_ptr == read_ptr {
             if i == 0 {
                 owned.write_ptr_contended().store(1, Ordering::Release);
+                // SeqCst fence pairs with the SeqCst fence in Producer between
+                // store(write_ptr) and load(write_ptr_contended), preventing a lost wakeup.
+                fence(Ordering::SeqCst);
                 write_ptr = readonly.write_ptr().load(Ordering::Acquire);
                 if write_ptr == read_ptr {
-                    if let Err(e) = readonly
-                        .write_ptr()
-                        .wait(write_ptr, self.timeout.as_ref())
-                    {
+                    if let Err(e) = readonly.write_ptr().wait(write_ptr, self.timeout.as_ref()) {
                         owned.write_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
@@ -179,6 +195,13 @@ impl<const N: usize> io::Read for Consumer<N> {
 
         if i == 0 {
             owned.write_ptr_contended().store(0, Ordering::Release);
+        }
+
+        // Reject an out-of-range write_ptr supplied by the untrusted peer.
+        // Without this check a malicious producer can set write_ptr = u32::MAX,
+        // making len() huge and causing an OOB panic in the wrap-around slice below.
+        if write_ptr >= N as u32 {
+            return Err(Self::invalid_peer_ptr());
         }
 
         let bytes_read = cmp::min(Self::len(read_ptr, write_ptr), buf.len());
@@ -197,7 +220,9 @@ impl<const N: usize> io::Read for Consumer<N> {
 
         read_ptr = ((read_ptr_usize + bytes_read) % N) as u32;
         owned.read_ptr().store(read_ptr, Ordering::Release);
-
+        // SeqCst fence pairs with the SeqCst fence in Producer between
+        // store(read_ptr_contended) and load(read_ptr), preventing a lost wakeup.
+        fence(Ordering::SeqCst);
         if readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
             owned.read_ptr().wake_one()?;
         }
@@ -247,6 +272,13 @@ impl<const N: usize> Producer<N> {
         }
     }
 
+    fn invalid_peer_ptr() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer sent out-of-range ring buffer pointer",
+        )
+    }
+
     /// Write exactly `LEN` bytes, spinning until space is available.
     ///
     /// Unlike `io::Write::write`, the size is a compile-time constant so LLVM
@@ -257,25 +289,40 @@ impl<const N: usize> Producer<N> {
         let readonly = self.readonly;
         let write_ptr = owned.write_ptr().load(Ordering::Acquire);
         let mut read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+        // Reject out-of-range read_ptr from the untrusted peer before passing it
+        // to empty_space(): a value >= N causes u32 underflow in len() and a panic
+        // in debug builds (or silent wrong behavior in release builds).
+        if read_ptr >= N as u32 {
+            return Err(Self::invalid_peer_ptr());
+        }
         let mut i = self.spin_limit;
         while Self::empty_space(read_ptr, write_ptr) < LEN {
             if i == 0 {
                 owned.read_ptr_contended().store(1, Ordering::Release);
+                // SeqCst fence pairs with the SeqCst fence in Consumer between
+                // store(read_ptr) and load(read_ptr_contended), preventing a lost wakeup.
+                fence(Ordering::SeqCst);
                 read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                if read_ptr >= N as u32 {
+                    return Err(Self::invalid_peer_ptr());
+                }
                 if Self::empty_space(read_ptr, write_ptr) < LEN {
-                    if let Err(e) = readonly
-                        .read_ptr()
-                        .wait(read_ptr, self.timeout.as_ref())
-                    {
+                    if let Err(e) = readonly.read_ptr().wait(read_ptr, self.timeout.as_ref()) {
                         owned.read_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
                     read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                    if read_ptr >= N as u32 {
+                        return Err(Self::invalid_peer_ptr());
+                    }
                 }
             } else {
                 i -= 1;
                 hint::spin_loop();
                 read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                if read_ptr >= N as u32 {
+                    return Err(Self::invalid_peer_ptr());
+                }
             }
         }
         if i == 0 {
@@ -307,8 +354,12 @@ impl<const N: usize> Producer<N> {
                 );
             }
         }
+
         let new_write_ptr = ((write_ptr_usize + LEN) % N) as u32;
         owned.write_ptr().store(new_write_ptr, Ordering::Release);
+        // SeqCst fence pairs with the SeqCst fence in Consumer between
+        // store(write_ptr_contended) and load(write_ptr), preventing a lost wakeup.
+        fence(Ordering::SeqCst);
         if readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
             owned.write_ptr().wake_one()?;
         }
@@ -331,6 +382,9 @@ impl<const N: usize> io::Write for Producer<N> {
         let readonly = self.readonly;
         let write_ptr = owned.write_ptr().load(Ordering::Acquire);
         let mut read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+        if read_ptr >= N as u32 {
+            return Err(Self::invalid_peer_ptr());
+        }
         let mut bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
         let mut i = self.spin_limit;
         // Spin until the consumer frees enough space.
@@ -338,23 +392,32 @@ impl<const N: usize> io::Write for Producer<N> {
         while bytes_written == 0 {
             if i == 0 {
                 owned.read_ptr_contended().store(1, Ordering::Release);
+                // SeqCst fence pairs with the SeqCst fence in Consumer between
+                // store(read_ptr) and load(read_ptr_contended), preventing a lost wakeup.
+                fence(Ordering::SeqCst);
                 read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                if read_ptr >= N as u32 {
+                    return Err(Self::invalid_peer_ptr());
+                }
                 bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
                 if bytes_written == 0 {
-                    if let Err(e) = readonly
-                        .read_ptr()
-                        .wait(read_ptr, self.timeout.as_ref())
-                    {
+                    if let Err(e) = readonly.read_ptr().wait(read_ptr, self.timeout.as_ref()) {
                         owned.read_ptr_contended().store(0, Ordering::Release);
                         return Err(e);
                     }
                     read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                    if read_ptr >= N as u32 {
+                        return Err(Self::invalid_peer_ptr());
+                    }
                     bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
                 }
             } else {
                 i -= 1;
                 hint::spin_loop();
                 read_ptr = readonly.read_ptr().load(Ordering::Acquire);
+                if read_ptr >= N as u32 {
+                    return Err(Self::invalid_peer_ptr());
+                }
                 bytes_written = cmp::min(Self::empty_space(read_ptr, write_ptr), buf.len());
             }
         }
@@ -377,7 +440,9 @@ impl<const N: usize> io::Write for Producer<N> {
 
         let write_ptr = ((write_ptr_usize + bytes_written) % N) as u32;
         owned.write_ptr().store(write_ptr, Ordering::Release);
-
+        // SeqCst fence pairs with the SeqCst fence in Consumer between
+        // store(write_ptr_contended) and load(write_ptr), preventing a lost wakeup.
+        fence(Ordering::SeqCst);
         if readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
             owned.write_ptr().wake_one()?;
         }
