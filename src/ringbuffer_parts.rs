@@ -1,20 +1,22 @@
 use std::{
     cell::UnsafeCell,
+    fs::File,
     io, mem,
-    os::fd::{AsRawFd, BorrowedFd},
+    ops::{Deref, DerefMut},
+    os::fd::AsRawFd,
     ptr,
     sync::atomic::AtomicU32,
 };
 
 use crate::{futex::Futex, page_size::page_size};
 
-unsafe fn mmap<T>(fd: BorrowedFd, offset: isize, prot: i32) -> io::Result<&'static mut T> {
+unsafe fn mmap<T>(file: &File, offset: isize, prot: i32) -> io::Result<&'static mut T> {
     let size = mem::size_of::<T>();
     let addr = ptr::null_mut();
     let offset = libc::off_t::try_from(offset)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset out of range"))?;
 
-    let mem = unsafe { libc::mmap(addr, size, prot, libc::MAP_SHARED, fd.as_raw_fd(), offset) };
+    let mem = unsafe { libc::mmap(addr, size, prot, libc::MAP_SHARED, file.as_raw_fd(), offset) };
 
     if mem == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
@@ -29,6 +31,72 @@ pub unsafe fn munmap<T>(ptr: *const T) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+pub struct MmappedMut<T> {
+    ptr: *mut T,
+}
+
+pub struct Mmapped<T> {
+    ptr: *const T,
+}
+
+impl<T: 'static> MmappedMut<T> {
+    pub fn new(file: &File, offset: isize) -> io::Result<Self> {
+        let mmapped = unsafe { mmap(file, offset, libc::PROT_READ | libc::PROT_WRITE)? };
+        Ok(Self {
+            ptr: mmapped as *mut T,
+        })
+    }
+}
+
+impl<T> Deref for MmappedMut<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<T> DerefMut for MmappedMut<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.ptr }
+    }
+}
+
+impl<T> Drop for MmappedMut<T> {
+    fn drop(&mut self) {
+        let size = mem::size_of::<T>();
+        if unsafe { libc::munmap(self.ptr as *mut libc::c_void, size) } != 0 {
+            eprintln!("Failed to unmap memory: {}", io::Error::last_os_error());
+        }
+    }
+}
+
+impl<T: 'static> Mmapped<T> {
+    pub fn new(file: &File, offset: isize) -> io::Result<Self> {
+        let mmapped = unsafe { mmap(file, offset, libc::PROT_READ)? };
+        Ok(Self {
+            ptr: mmapped as *const T,
+        })
+    }
+}
+
+impl<T> Deref for Mmapped<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<T> Drop for Mmapped<T> {
+    fn drop(&mut self) {
+        let size = mem::size_of::<T>();
+        if unsafe { libc::munmap(self.ptr as *mut libc::c_void, size) } != 0 {
+            eprintln!("Failed to unmap memory: {}", io::Error::last_os_error());
+        }
+    }
 }
 
 /// Ring buffer part that is owned by the producer.
@@ -52,13 +120,13 @@ pub struct ConsumerOwned<const N: usize> {
 }
 
 impl<const N: usize> ConsumerOwned<N> {
-    pub fn mmap_rw(fd: BorrowedFd, offset: isize) -> io::Result<&'static mut Self> {
-        unsafe { mmap(fd, offset, libc::PROT_READ | libc::PROT_WRITE) }
-    }
+    // pub fn mmap_rw(file: &File, offset: isize) -> io::Result<&'static mut Self> {
+    //     unsafe { mmap(file, offset, libc::PROT_READ | libc::PROT_WRITE) }
+    // }
 
-    pub fn mmap_ro(fd: BorrowedFd, offset: isize) -> io::Result<&'static mut Self> {
-        unsafe { mmap(fd, offset, libc::PROT_READ) }
-    }
+    // pub fn mmap_ro(file: &File, offset: isize) -> io::Result<&'static mut Self> {
+    //     unsafe { mmap(file, offset, libc::PROT_READ) }
+    // }
 
     pub fn read_ptr(&self) -> &Futex {
         &self.read_ptr
@@ -79,13 +147,13 @@ impl<const N: usize> ConsumerOwned<N> {
 }
 
 impl<const N: usize> ProducerOwned<N> {
-    pub fn mmap_rw(fd: BorrowedFd, offset: isize) -> io::Result<&'static mut Self> {
-        unsafe { mmap(fd, offset, libc::PROT_READ | libc::PROT_WRITE) }
-    }
+    // pub fn mmap_rw(file: &File, offset: isize) -> io::Result<&'static mut Self> {
+    //     unsafe { mmap(file, offset, libc::PROT_READ | libc::PROT_WRITE) }
+    // }
 
-    pub fn mmap_ro(fd: BorrowedFd, offset: isize) -> io::Result<&'static mut Self> {
-        unsafe { mmap(fd, offset, libc::PROT_READ) }
-    }
+    // pub fn mmap_ro(file: &File, offset: isize) -> io::Result<&'static mut Self> {
+    //     unsafe { mmap(file, offset, libc::PROT_READ) }
+    // }
 
     pub fn write_ptr(&self) -> &Futex {
         &self.write_ptr

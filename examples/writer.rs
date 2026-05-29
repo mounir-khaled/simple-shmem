@@ -1,4 +1,4 @@
-use std::{error::Error, fs::remove_file, io::Write, os::unix::net::UnixDatagram};
+use std::{error::Error, io::Write, os::unix::net::UnixStream};
 
 use simple_shmem::{FastDualRingBuffers, StdDualRingBuffers};
 
@@ -6,9 +6,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     const ROUNDS: usize = 100000;
     const MSG_SIZE: usize = 1024;
 
-    let _ = remove_file("/tmp/writer.sock");
-    let mut uds = UnixDatagram::bind("/tmp/writer.sock")?;
-    let mut rb = FastDualRingBuffers::connect(&mut uds, "/tmp/reader.sock", |_, _| true)?;
+    let stream = UnixStream::connect("/tmp/reader.sock")?;
+    let mut rb = StdDualRingBuffers::connect(&stream)?;
 
     let mut msg = [0u8; MSG_SIZE];
     for i in 0..MSG_SIZE {

@@ -1,13 +1,14 @@
 use std::{
-    cmp, hint, io,
-    os::fd::BorrowedFd,
+    cmp,
+    fs::File,
+    hint, io,
     sync::atomic::{Ordering, fence},
     time::Duration,
 };
 
 use thiserror::Error;
 
-use crate::ringbuffer_parts::{ConsumerOwned, ProducerOwned, munmap};
+use crate::ringbuffer_parts::{ConsumerOwned, Mmapped, MmappedMut, ProducerOwned};
 
 const DEFAULT_SPIN_LIMIT: u32 = 100;
 
@@ -16,8 +17,8 @@ pub struct Producer<const N: usize> {
     timeout: Option<Duration>,
     /// Total number of spin iterations before sleeping via futex.
     spin_limit: u32,
-    owned: &'static ProducerOwned<N>,
-    readonly: &'static ConsumerOwned<N>,
+    owned: MmappedMut<ProducerOwned<N>>,
+    readonly: Mmapped<ConsumerOwned<N>>,
 }
 
 /// A ring buffer that can only read data
@@ -25,8 +26,8 @@ pub struct Consumer<const N: usize> {
     timeout: Option<Duration>,
     /// Total number of spin iterations before sleeping via futex.
     spin_limit: u32,
-    owned: &'static ConsumerOwned<N>,
-    readonly: &'static ProducerOwned<N>,
+    owned: MmappedMut<ConsumerOwned<N>>,
+    readonly: Mmapped<ProducerOwned<N>>,
 }
 
 #[derive(Error, Debug)]
@@ -38,24 +39,16 @@ pub enum ConsumerProducerError {
 }
 
 impl<const N: usize> Consumer<N> {
-    pub fn new(
-        owned_fd: BorrowedFd,
-        owned_offset: isize,
-        readonly_fd: BorrowedFd,
-        readonly_offset: isize,
-    ) -> Result<Self, ConsumerProducerError> {
-        let owned = ConsumerOwned::mmap_rw(owned_fd, owned_offset)
-            .map_err(ConsumerProducerError::OwnedMmap)?;
-
-        let readonly = ProducerOwned::mmap_ro(readonly_fd, readonly_offset)
-            .map_err(ConsumerProducerError::ReadonlyMmap)?;
-
-        Ok(Self {
+    pub unsafe fn new(
+        owned: MmappedMut<ConsumerOwned<N>>,
+        readonly: Mmapped<ProducerOwned<N>>,
+    ) -> Self {
+        Self {
             timeout: None,
             spin_limit: DEFAULT_SPIN_LIMIT,
             owned,
             readonly,
-        })
+        }
     }
 
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
@@ -80,93 +73,14 @@ impl<const N: usize> Consumer<N> {
             "peer sent out-of-range ring buffer pointer",
         )
     }
-
-    /// Read exactly `LEN` bytes, spinning until they are available.
-    ///
-    /// Unlike `io::Read::read`, the size is a compile-time constant so LLVM
-    /// inlines the memory copy as a direct register-width load/store instead
-    /// of an indirect `memcpy` call.
-    pub fn read_fixed<const LEN: usize>(&mut self, buf: &mut [u8; LEN]) -> io::Result<()> {
-        let owned = self.owned;
-        let readonly = self.readonly;
-        let read_ptr = owned.read_ptr().load(Ordering::Acquire);
-        let mut write_ptr = readonly.write_ptr().load(Ordering::Acquire);
-        let mut i = self.spin_limit;
-        while write_ptr == read_ptr {
-            if i == 0 {
-                owned.write_ptr_contended().store(1, Ordering::Release); // SeqCst fence pairs with the SeqCst fence in Producer between
-                // store(write_ptr) and load(write_ptr_contended), preventing a lost wakeup.
-                fence(Ordering::SeqCst);
-                write_ptr = readonly.write_ptr().load(Ordering::Acquire);
-                if write_ptr == read_ptr {
-                    if let Err(e) = readonly.write_ptr().wait(write_ptr, self.timeout.as_ref()) {
-                        owned.write_ptr_contended().store(0, Ordering::Release);
-                        return Err(e);
-                    }
-                    write_ptr = readonly.write_ptr().load(Ordering::Acquire);
-                }
-            } else {
-                i -= 1;
-                hint::spin_loop();
-                write_ptr = readonly.write_ptr().load(Ordering::Acquire);
-            }
-        }
-        if i == 0 {
-            owned.write_ptr_contended().store(0, Ordering::Release);
-        }
-        let read_ptr_usize = read_ptr as usize;
-        let buffer = readonly.buffer();
-        if read_ptr_usize + LEN <= N {
-            // LEN is a compile-time constant: LLVM emits an inline register-width copy.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buffer.as_ptr().add(read_ptr_usize),
-                    buf.as_mut_ptr(),
-                    LEN,
-                );
-            }
-        } else {
-            let first_part_len = N - read_ptr_usize;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buffer.as_ptr().add(read_ptr_usize),
-                    buf.as_mut_ptr(),
-                    first_part_len,
-                );
-                std::ptr::copy_nonoverlapping(
-                    buffer.as_ptr(),
-                    buf.as_mut_ptr().add(first_part_len),
-                    LEN - first_part_len,
-                );
-            }
-        }
-        let new_read_ptr = ((read_ptr_usize + LEN) % N) as u32;
-        owned.read_ptr().store(new_read_ptr, Ordering::Release);
-        // SeqCst fence pairs with the SeqCst fence in Producer between
-        // store(read_ptr_contended) and load(read_ptr), ensuring that either
-        // the producer sees the new read_ptr (and doesn't block) or we see
-        // read_ptr_contended=1 (and call wake_one), preventing a lost wakeup.
-        fence(Ordering::SeqCst);
-        if readonly.read_ptr_contended().load(Ordering::Acquire) != 0 {
-            owned.read_ptr().wake_one()?;
-        }
-        Ok(())
-    }
-}
-
-impl<const N: usize> Drop for Consumer<N> {
-    fn drop(&mut self) {
-        let _ = unsafe { munmap(self.owned as *const ConsumerOwned<N>) };
-        let _ = unsafe { munmap(self.readonly as *const ProducerOwned<N>) };
-    }
 }
 
 impl<const N: usize> io::Read for Consumer<N> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Cache the two pointers in locals so LLVM can keep them in registers
         // across the spin loop rather than reloading through &mut self every iteration.
-        let owned = self.owned;
-        let readonly = self.readonly;
+        let owned = &self.owned;
+        let readonly = &self.readonly;
         let mut read_ptr = owned.read_ptr().load(Ordering::Acquire);
         let mut write_ptr = readonly.write_ptr().load(Ordering::Acquire);
         let mut i = self.spin_limit;
@@ -232,16 +146,28 @@ impl<const N: usize> io::Read for Consumer<N> {
 }
 
 impl<const N: usize> Producer<N> {
-    pub fn new(
-        owned_fd: BorrowedFd,
+    pub unsafe fn new(
+        owned: MmappedMut<ProducerOwned<N>>,
+        readonly: Mmapped<ConsumerOwned<N>>,
+    ) -> Self {
+        Self {
+            timeout: None,
+            spin_limit: DEFAULT_SPIN_LIMIT,
+            owned,
+            readonly,
+        }
+    }
+
+    pub fn with_files_and_offsets(
+        owned_fd: &File,
         owned_offset: isize,
-        readonly_fd: BorrowedFd,
+        readonly_fd: &File,
         readonly_offset: isize,
     ) -> Result<Self, ConsumerProducerError> {
-        let owned = ProducerOwned::mmap_rw(owned_fd, owned_offset)
-            .map_err(ConsumerProducerError::OwnedMmap)?;
+        let owned =
+            MmappedMut::new(owned_fd, owned_offset).map_err(ConsumerProducerError::OwnedMmap)?;
 
-        let readonly = ConsumerOwned::mmap_ro(readonly_fd, readonly_offset)
+        let readonly = Mmapped::new(readonly_fd, readonly_offset)
             .map_err(ConsumerProducerError::ReadonlyMmap)?;
 
         Ok(Self {
@@ -278,108 +204,14 @@ impl<const N: usize> Producer<N> {
             "peer sent out-of-range ring buffer pointer",
         )
     }
-
-    /// Write exactly `LEN` bytes, spinning until space is available.
-    ///
-    /// Unlike `io::Write::write`, the size is a compile-time constant so LLVM
-    /// inlines the memory copy as a direct register-width load/store instead
-    /// of an indirect `memcpy` call.
-    pub fn write_fixed<const LEN: usize>(&mut self, buf: &[u8; LEN]) -> io::Result<()> {
-        let owned = self.owned;
-        let readonly = self.readonly;
-        let write_ptr = owned.write_ptr().load(Ordering::Acquire);
-        let mut read_ptr = readonly.read_ptr().load(Ordering::Acquire);
-        // Reject out-of-range read_ptr from the untrusted peer before passing it
-        // to empty_space(): a value >= N causes u32 underflow in len() and a panic
-        // in debug builds (or silent wrong behavior in release builds).
-        if read_ptr >= N as u32 {
-            return Err(Self::invalid_peer_ptr());
-        }
-        let mut i = self.spin_limit;
-        while Self::empty_space(read_ptr, write_ptr) < LEN {
-            if i == 0 {
-                owned.read_ptr_contended().store(1, Ordering::Release);
-                // SeqCst fence pairs with the SeqCst fence in Consumer between
-                // store(read_ptr) and load(read_ptr_contended), preventing a lost wakeup.
-                fence(Ordering::SeqCst);
-                read_ptr = readonly.read_ptr().load(Ordering::Acquire);
-                if read_ptr >= N as u32 {
-                    return Err(Self::invalid_peer_ptr());
-                }
-                if Self::empty_space(read_ptr, write_ptr) < LEN {
-                    if let Err(e) = readonly.read_ptr().wait(read_ptr, self.timeout.as_ref()) {
-                        owned.read_ptr_contended().store(0, Ordering::Release);
-                        return Err(e);
-                    }
-                    read_ptr = readonly.read_ptr().load(Ordering::Acquire);
-                    if read_ptr >= N as u32 {
-                        return Err(Self::invalid_peer_ptr());
-                    }
-                }
-            } else {
-                i -= 1;
-                hint::spin_loop();
-                read_ptr = readonly.read_ptr().load(Ordering::Acquire);
-                if read_ptr >= N as u32 {
-                    return Err(Self::invalid_peer_ptr());
-                }
-            }
-        }
-        if i == 0 {
-            owned.read_ptr_contended().store(0, Ordering::Release);
-        }
-        let write_ptr_usize = write_ptr as usize;
-        let buffer = owned.buffer_mut();
-        if write_ptr_usize + LEN <= N {
-            // LEN is a compile-time constant: LLVM emits an inline register-width copy.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    buffer.as_mut_ptr().add(write_ptr_usize),
-                    LEN,
-                );
-            }
-        } else {
-            let first_part_len = N - write_ptr_usize;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    buffer.as_mut_ptr().add(write_ptr_usize),
-                    first_part_len,
-                );
-                std::ptr::copy_nonoverlapping(
-                    buf.as_ptr().add(first_part_len),
-                    buffer.as_mut_ptr(),
-                    LEN - first_part_len,
-                );
-            }
-        }
-
-        let new_write_ptr = ((write_ptr_usize + LEN) % N) as u32;
-        owned.write_ptr().store(new_write_ptr, Ordering::Release);
-        // SeqCst fence pairs with the SeqCst fence in Consumer between
-        // store(write_ptr_contended) and load(write_ptr), preventing a lost wakeup.
-        fence(Ordering::SeqCst);
-        if readonly.write_ptr_contended().load(Ordering::Acquire) != 0 {
-            owned.write_ptr().wake_one()?;
-        }
-        Ok(())
-    }
-}
-
-impl<const N: usize> Drop for Producer<N> {
-    fn drop(&mut self) {
-        let _ = unsafe { munmap(self.owned as *const ProducerOwned<N>) };
-        let _ = unsafe { munmap(self.readonly as *const ConsumerOwned<N>) };
-    }
 }
 
 impl<const N: usize> io::Write for Producer<N> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Cache the two pointers in locals so LLVM can keep them in registers
         // across the spin loop rather than reloading through &mut self every iteration.
-        let owned = self.owned;
-        let readonly = self.readonly;
+        let owned = &self.owned;
+        let readonly = &self.readonly;
         let write_ptr = owned.write_ptr().load(Ordering::Acquire);
         let mut read_ptr = readonly.read_ptr().load(Ordering::Acquire);
         if read_ptr >= N as u32 {

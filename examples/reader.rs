@@ -1,17 +1,17 @@
-use std::{error::Error, fs::remove_file, io::Read, os::unix::net::UnixDatagram};
+use std::{error::Error, fs::remove_file, io::Read, os::unix::net::UnixListener};
 
-use simple_shmem::{FastDualRingBuffers, StdDualRingBuffers, listener::Listener};
+use simple_shmem::{FastDualRingBuffers, StdDualRingBuffers};
 
 fn main() -> Result<(), Box<dyn Error>> {
     const MSG_SIZE: usize = 1024;
 
     let _ = remove_file("/tmp/reader.sock");
-    let uds = UnixDatagram::bind("/tmp/reader.sock")?;
-    let mut listener = Listener::new(uds)?;
+    let listener = UnixListener::bind("/tmp/reader.sock")?;
 
     let mut msg = [0u8; MSG_SIZE];
     loop {
-        let mut rb: FastDualRingBuffers = listener.accept(|_, _| true)?;
+        let (stream, _) = listener.accept()?;
+        let mut rb = StdDualRingBuffers::accept(&stream)?;
         eprintln!("Accepted connection");
         loop {
             rb.read_exact(&mut msg)?;
@@ -19,6 +19,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("Writer said goodbye, exiting");
                 break;
             }
+
+            // sign with some secret signing key
+            // and send back to the writer
+            // for them to send an authenticated message
+            // that proves that it came from the machine
+            // with the signing key
         }
     }
 
