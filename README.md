@@ -1,4 +1,8 @@
-# IPC Ring Buffer
+# Shared Memory IPC in Rust
+
+Establishing shared memory for interprocess communication (IPC) between mutually distrustful processes is non-trivial to implement safely. This library aims to do that securely, using an already-established Unix domain socket connection to share the shared memory file descriptors, and modifying their seals to protect them from tampering by the other endpoint. 
+
+## Dual Ring Buffer Layout
 
 A dual IPC ring buffer is 2 memory-mapped memfds. An endpoint mmaps its "owned" memfd as read-write and the shared memfd as read-only. The other endpoint opens the same memfds but with the inverse designation and permissions.
 
@@ -25,3 +29,7 @@ pub struct ConsumerOwned<const N: usize> {
     buffer: UnsafeCell<[u8; N]>,
 }
 ```
+
+## Why read/write API instead of zerocopy?
+
+Time-of-check-time-of-use (TOCTOU) vulnerabilities; With zerocopy, a malicious endpoint can send some benign data, the victim process validates the data to be "secure", then the malicious endpoint later modifies the data to be malicious after it passes validation but before it gets used.
