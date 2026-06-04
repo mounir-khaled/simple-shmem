@@ -1,6 +1,6 @@
 # IPC Ring Buffer
 
-A dual IPC ring buffer is 2 memory-mapped files. An endpoint opens its "owned" file as read-write and the shared file as read-only. The other endpoint opens the same files but with the inverse designation and permissions.
+A dual IPC ring buffer is 2 memory-mapped memfds. An endpoint mmaps its "owned" memfd as read-write and the shared memfd as read-only. The other endpoint opens the same memfds but with the inverse designation and permissions.
 
 Both files have the same layout of the following structures, page-aligned:
 
