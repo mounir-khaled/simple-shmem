@@ -120,14 +120,6 @@ pub struct ConsumerOwned<const N: usize> {
 }
 
 impl<const N: usize> ConsumerOwned<N> {
-    // pub fn mmap_rw(file: &File, offset: isize) -> io::Result<&'static mut Self> {
-    //     unsafe { mmap(file, offset, libc::PROT_READ | libc::PROT_WRITE) }
-    // }
-
-    // pub fn mmap_ro(file: &File, offset: isize) -> io::Result<&'static mut Self> {
-    //     unsafe { mmap(file, offset, libc::PROT_READ) }
-    // }
-
     pub fn read_ptr(&self) -> &Futex {
         &self.read_ptr
     }
@@ -147,14 +139,6 @@ impl<const N: usize> ConsumerOwned<N> {
 }
 
 impl<const N: usize> ProducerOwned<N> {
-    // pub fn mmap_rw(file: &File, offset: isize) -> io::Result<&'static mut Self> {
-    //     unsafe { mmap(file, offset, libc::PROT_READ | libc::PROT_WRITE) }
-    // }
-
-    // pub fn mmap_ro(file: &File, offset: isize) -> io::Result<&'static mut Self> {
-    //     unsafe { mmap(file, offset, libc::PROT_READ) }
-    // }
-
     pub fn write_ptr(&self) -> &Futex {
         &self.write_ptr
     }
